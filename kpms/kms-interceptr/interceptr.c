@@ -12,6 +12,8 @@
 #include <linux/string.h>
 #include <kputils.h>
 #include <asm/current.h>
+#include <linux/sched.h>      // 提供完整的 task_struct 定义
+#include <linux/uio.h>        // 提供 struct iovec
 
 KPM_NAME("KernelMemorySky");
 KPM_VERSION("1.0.0");
@@ -81,7 +83,6 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
     printk(KERN_INFO "KMS| process_vm_readv | PID=%d TGID=%d TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
            pid, tgid, target_pid, local_iov, liovcnt, remote_iov, riovcnt, flags);
 
-    // 尝试读取 local_iov 第一个元素的内容（如果可能）
     if (local_iov && liovcnt > 0) {
         struct iovec __user *local_vec = (struct iovec __user *)local_iov;
         struct iovec vec;
@@ -145,7 +146,7 @@ static long init(const char *args, const char *event, void *__user reserved)
     return 0;
 }
 
-static long exit(void *__user reserved)
+static long interceptr_exit(void *__user reserved)
 {
     fp_unhook_syscalln(__NR_pread64, before_pread64, 0);
     fp_unhook_syscalln(__NR_pwrite64, before_pwrite64, 0);
@@ -156,4 +157,4 @@ static long exit(void *__user reserved)
 }
 
 KPM_INIT(init);
-KPM_EXIT(exit);
+KPM_EXIT(interceptr_exit);

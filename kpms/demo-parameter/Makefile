@@ -19,7 +19,7 @@ objs := parameter.o
 all: parameter.kpm
 
 parameter.kpm: ${objs}
-        ${CC} -r -o $@ $^
+		${CC} -r -o $@ $^
 
 %.o: %.c
         ${CC} $(CFLAGS) $(INCLUDE_FLAGS) -c -O2 -o $@ $<

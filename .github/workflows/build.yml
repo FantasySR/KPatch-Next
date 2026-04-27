@@ -61,9 +61,9 @@ jobs:
           make
           mv syscallhook.kpm demo-syscallhook.kpm
 
-          cd ../demo-interceptr
+          cd ../kms-interceptr
           make
-          mv interceptr.kpm demo-interceptr.kpm
+          mv interceptr.kpm release-interceptr.kpm
 
       - name: Upload elf
         uses: actions/upload-artifact@v4
@@ -82,7 +82,7 @@ jobs:
             kpms/demo-hello/demo-hello.kpm
             kpms/demo-inlinehook/demo-inlinehook.kpm
             kpms/demo-syscallhook/demo-syscallhook.kpm
-            kpms/kms-interceptr/interceptr.kpm
+            kpms/kms-interceptr/release-interceptr.kpm
           generateReleaseNotes: true
           allowUpdates: true
           replacesArtifacts: true

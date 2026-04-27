@@ -1,9 +1,9 @@
 ifndef TARGET_COMPILE
-    $(error TARGET_COMPILE not set)
+	$(error TARGET_COMPILE not set)
 endif
 
 ifndef KP_DIR
-    KP_DIR = ../..
+	KP_DIR = ../..
 endif
 
 
@@ -19,12 +19,12 @@ objs := parameter.o
 all: parameter.kpm
 
 parameter.kpm: ${objs}
-        ${CC} -r -o $@ $^
+		${CC} -r -o $@ $^
 
 %.o: %.c
-        ${CC} $(CFLAGS) $(INCLUDE_FLAGS) -c -O2 -o $@ $<
+		${CC} $(CFLAGS) $(INCLUDE_FLAGS) -c -O2 -o $@ $<
 
 .PHONY: clean
 clean:
-        rm -rf *.kpm
-        find . -name "*.o" | xargs rm -f
+		rm -rf *.kpm
+		find . -name "*.o" | xargs rm -f

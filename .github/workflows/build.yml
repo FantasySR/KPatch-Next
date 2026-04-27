@@ -61,10 +61,6 @@ jobs:
           make
           mv syscallhook.kpm demo-syscallhook.kpm
 
-          cd ../demo-interceptr
-          make
-          mv interceptr.kpm demo-interceptr.kpm
-
       - name: Upload elf
         uses: actions/upload-artifact@v4
         with:

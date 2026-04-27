@@ -11,17 +11,16 @@
 #include <linux/uaccess.h>
 #include <linux/string.h>
 #include <kputils.h>
-#include <asm/current.h>
-#include <linux/sched.h>      // 提供完整的 task_struct 定义
+#include <asm/current.h>      // 这个头文件确保 current 宏可用
 
-/* 环境不提供 linux/uio.h，我们自己定义一个兼容的结构体 */
+/* 手工声明缺失的类型和函数 */
 struct kms_iovec {
     void __user *iov_base;
     unsigned long iov_len;
 };
 
-/* 显式声明 copy_from_user，避免隐式声明 */
 extern unsigned long copy_from_user(void *to, const void __user *from, unsigned long n);
+extern unsigned long copy_to_user(void __user *to, const void *from, unsigned long n);
 
 KPM_NAME("KernelMemorySky");
 KPM_VERSION("1.0.0");

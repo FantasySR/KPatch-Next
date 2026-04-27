@@ -73,6 +73,10 @@ jobs:
           make
           mv inlinehook.kpm demo-inlinehook.kpm
 
+          cd ../demo-parameter
+          make
+          mv parameter.kpm demo-parameter.kpm
+
           cd ../demo-syscallhook
           make
           mv syscallhook.kpm demo-syscallhook.kpm

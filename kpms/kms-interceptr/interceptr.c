@@ -13,7 +13,15 @@
 #include <kputils.h>
 #include <asm/current.h>
 #include <linux/sched.h>      // 提供完整的 task_struct 定义
-#include <linux/uio.h>        // 提供 struct iovec
+
+/* 环境不提供 linux/uio.h，我们自己定义一个兼容的结构体 */
+struct kms_iovec {
+    void __user *iov_base;
+    unsigned long iov_len;
+};
+
+/* 显式声明 copy_from_user，避免隐式声明 */
+extern unsigned long copy_from_user(void *to, const void __user *from, unsigned long n);
 
 KPM_NAME("KernelMemorySky");
 KPM_VERSION("1.0.0");
@@ -67,7 +75,7 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
     }
 }
 
-/* ---- process_vm_readv (pid, local_iov, liovcnt, remote_iov, riovcnt, flags) ---- */
+/* ---- process_vm_readv ---- */
 static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
 {
     pid_t target_pid = (pid_t)syscall_argn(fargs, 0);
@@ -84,8 +92,8 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
            pid, tgid, target_pid, local_iov, liovcnt, remote_iov, riovcnt, flags);
 
     if (local_iov && liovcnt > 0) {
-        struct iovec __user *local_vec = (struct iovec __user *)local_iov;
-        struct iovec vec;
+        struct kms_iovec __user *local_vec = (struct kms_iovec __user *)local_iov;
+        struct kms_iovec vec;
         if (copy_from_user(&vec, local_vec, sizeof(vec)) == 0 && vec.iov_base && vec.iov_len > 0) {
             unsigned char tmp[32];
             unsigned long len = vec.iov_len < 32 ? vec.iov_len : 32;
@@ -96,7 +104,7 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
     }
 }
 
-/* ---- process_vm_writev (pid, local_iov, liovcnt, remote_iov, riovcnt, flags) ---- */
+/* ---- process_vm_writev ---- */
 static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
 {
     pid_t target_pid = (pid_t)syscall_argn(fargs, 0);
@@ -113,8 +121,8 @@ static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
            pid, tgid, target_pid, local_iov, liovcnt, remote_iov, riovcnt, flags);
 
     if (local_iov && liovcnt > 0) {
-        struct iovec __user *local_vec = (struct iovec __user *)local_iov;
-        struct iovec vec;
+        struct kms_iovec __user *local_vec = (struct kms_iovec __user *)local_iov;
+        struct kms_iovec vec;
         if (copy_from_user(&vec, local_vec, sizeof(vec)) == 0 && vec.iov_base && vec.iov_len > 0) {
             unsigned char tmp[32];
             unsigned long len = vec.iov_len < 32 ? vec.iov_len : 32;

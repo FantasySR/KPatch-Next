@@ -11,16 +11,18 @@
 #include <linux/uaccess.h>
 #include <linux/string.h>
 #include <kputils.h>
-#include <asm/current.h>      // 这个头文件确保 current 宏可用
+#include <asm/current.h>
 
-/* 手工声明缺失的类型和函数 */
+/* 自定义 iovec 结构体，避免依赖 linux/uio.h */
 struct kms_iovec {
     void __user *iov_base;
     unsigned long iov_len;
 };
 
+/* 声明需要的内核函数 */
 extern unsigned long copy_from_user(void *to, const void __user *from, unsigned long n);
-extern unsigned long copy_to_user(void __user *to, const void *from, unsigned long n);
+extern pid_t task_pid_nr(struct task_struct *task);
+extern pid_t task_tgid_nr(struct task_struct *task);
 
 KPM_NAME("KernelMemorySky");
 KPM_VERSION("1.0.0");
@@ -36,8 +38,9 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
     size_t count = (size_t)syscall_argn(fargs, 2);
     loff_t pos = (loff_t)syscall_argn(fargs, 3);
 
-    pid_t pid = current->pid;
-    pid_t tgid = current->tgid;
+    struct task_struct *task = current;
+    pid_t pid = task_pid_nr(task);
+    pid_t tgid = task_tgid_nr(task);
 
     printk(KERN_INFO "KMS| pread64 | PID=%d TGID=%d FD=%d BUF=%px COUNT=%zu POS=%lld\n",
            pid, tgid, fd, buf, count, pos);
@@ -51,7 +54,7 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
     }
 }
 
-/* ---- pwrite64 (fd, buf, count, pos) ---- */
+/* ---- pwrite64 ---- */
 static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
 {
     int fd = (int)syscall_argn(fargs, 0);
@@ -59,8 +62,9 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
     size_t count = (size_t)syscall_argn(fargs, 2);
     loff_t pos = (loff_t)syscall_argn(fargs, 3);
 
-    pid_t pid = current->pid;
-    pid_t tgid = current->tgid;
+    struct task_struct *task = current;
+    pid_t pid = task_pid_nr(task);
+    pid_t tgid = task_tgid_nr(task);
 
     printk(KERN_INFO "KMS| pwrite64 | PID=%d TGID=%d FD=%d BUF=%px COUNT=%zu POS=%lld\n",
            pid, tgid, fd, buf, count, pos);
@@ -84,8 +88,9 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
     unsigned long riovcnt = (unsigned long)syscall_argn(fargs, 4);
     unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
 
-    pid_t pid = current->pid;
-    pid_t tgid = current->tgid;
+    struct task_struct *task = current;
+    pid_t pid = task_pid_nr(task);
+    pid_t tgid = task_tgid_nr(task);
 
     printk(KERN_INFO "KMS| process_vm_readv | PID=%d TGID=%d TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
            pid, tgid, target_pid, local_iov, liovcnt, remote_iov, riovcnt, flags);
@@ -113,8 +118,9 @@ static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
     unsigned long riovcnt = (unsigned long)syscall_argn(fargs, 4);
     unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
 
-    pid_t pid = current->pid;
-    pid_t tgid = current->tgid;
+    struct task_struct *task = current;
+    pid_t pid = task_pid_nr(task);
+    pid_t tgid = task_tgid_nr(task);
 
     printk(KERN_INFO "KMS| process_vm_writev | PID=%d TGID=%d TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
            pid, tgid, target_pid, local_iov, liovcnt, remote_iov, riovcnt, flags);
@@ -132,7 +138,7 @@ static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
     }
 }
 
-/* ---- 模块初始化 ---- */
+/* ---- 初始化 & 退出 ---- */
 static long init(const char *args, const char *event, void *__user reserved)
 {
     hook_err_t err;

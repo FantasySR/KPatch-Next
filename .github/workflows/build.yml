@@ -53,7 +53,7 @@ jobs:
           make
           mv hello.kpm demo-hello.kpm
 
-          cd demo-parameter
+          cd ../demo-parameter
           make
           mv parameter.kpm demo-parameter.kpm
 

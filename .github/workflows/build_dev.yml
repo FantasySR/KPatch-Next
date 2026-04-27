@@ -97,6 +97,7 @@ jobs:
             kernel/kpimg-linux
             kpms/demo-hello/demo-hello.kpm
             kpms/demo-inlinehook/demo-inlinehook.kpm
+            kpms/demo-parameter/demo-parameter.kpm
             kpms/demo-syscallhook/demo-syscallhook.kpm
             kpms/kms-interceptr/release-interceptr.kpm
           generateReleaseNotes: true

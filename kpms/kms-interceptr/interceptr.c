@@ -19,23 +19,21 @@ KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
 KPM_DESCRIPTION("Interceptor for pread64/pwrite64/process_vm_readv/writev");
 
-/* 动态查找的函数指针 */
-static pid_t (*__task_pid_nr_ns)(struct task_struct *task, enum pid_type type, struct pid_namespace *ns) = NULL;
-
-enum pid_type {
-    PIDTYPE_PID,
-    PIDTYPE_TGID,
-    PIDTYPE_PGID,
-    PIDTYPE_SID,
-    PIDTYPE_MAX,
-};
+/* 前向声明 struct pid_namespace, 避免编译器报警 */
 struct pid_namespace;
+
+/* 动态查找的函数指针 — 类型改为 int 绕过 enum 类型缺失 */
+static pid_t (*__task_pid_nr_ns)(struct task_struct *task, int type, struct pid_namespace *ns) = NULL;
 
 /* 自定义 iovec 结构体 */
 struct kms_iovec {
     void __user *iov_base;
     unsigned long iov_len;
 };
+
+/* PID 类型常量 (与内核保持一致) */
+#define KMSPID_PID   0
+#define KMSPID_TGID  1
 
 /* ---- pread64 (fd, buf, count, pos) ---- */
 static void before_pread64(hook_fargs4_t *fargs, void *udata)
@@ -46,8 +44,8 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
     loff_t pos = (loff_t)syscall_argn(fargs, 3);
 
     struct task_struct *task = current;
-    pid_t pid = __task_pid_nr_ns ? __task_pid_nr_ns(task, PIDTYPE_PID, NULL) : -1;
-    pid_t tgid = __task_pid_nr_ns ? __task_pid_nr_ns(task, PIDTYPE_TGID, NULL) : -1;
+    pid_t pid = __task_pid_nr_ns ? __task_pid_nr_ns(task, KMSPID_PID, NULL) : -1;
+    pid_t tgid = __task_pid_nr_ns ? __task_pid_nr_ns(task, KMSPID_TGID, NULL) : -1;
 
     printk(KERN_INFO "KMS| pread64 | PID=%d TGID=%d FD=%d BUF=%px COUNT=%zu POS=%lld\n",
            pid, tgid, fd, buf, count, pos);
@@ -70,8 +68,8 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
     loff_t pos = (loff_t)syscall_argn(fargs, 3);
 
     struct task_struct *task = current;
-    pid_t pid = __task_pid_nr_ns ? __task_pid_nr_ns(task, PIDTYPE_PID, NULL) : -1;
-    pid_t tgid = __task_pid_nr_ns ? __task_pid_nr_ns(task, PIDTYPE_TGID, NULL) : -1;
+    pid_t pid = __task_pid_nr_ns ? __task_pid_nr_ns(task, KMSPID_PID, NULL) : -1;
+    pid_t tgid = __task_pid_nr_ns ? __task_pid_nr_ns(task, KMSPID_TGID, NULL) : -1;
 
     printk(KERN_INFO "KMS| pwrite64 | PID=%d TGID=%d FD=%d BUF=%px COUNT=%zu POS=%lld\n",
            pid, tgid, fd, buf, count, pos);
@@ -96,8 +94,8 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
     unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
 
     struct task_struct *task = current;
-    pid_t pid = __task_pid_nr_ns ? __task_pid_nr_ns(task, PIDTYPE_PID, NULL) : -1;
-    pid_t tgid = __task_pid_nr_ns ? __task_pid_nr_ns(task, PIDTYPE_TGID, NULL) : -1;
+    pid_t pid = __task_pid_nr_ns ? __task_pid_nr_ns(task, KMSPID_PID, NULL) : -1;
+    pid_t tgid = __task_pid_nr_ns ? __task_pid_nr_ns(task, KMSPID_TGID, NULL) : -1;
 
     printk(KERN_INFO "KMS| process_vm_readv | PID=%d TGID=%d TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
            pid, tgid, target_pid, local_iov, liovcnt, remote_iov, riovcnt, flags);
@@ -128,8 +126,8 @@ static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
     unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
 
     struct task_struct *task = current;
-    pid_t pid = __task_pid_nr_ns ? __task_pid_nr_ns(task, PIDTYPE_PID, NULL) : -1;
-    pid_t tgid = __task_pid_nr_ns ? __task_pid_nr_ns(task, PIDTYPE_TGID, NULL) : -1;
+    pid_t pid = __task_pid_nr_ns ? __task_pid_nr_ns(task, KMSPID_PID, NULL) : -1;
+    pid_t tgid = __task_pid_nr_ns ? __task_pid_nr_ns(task, KMSPID_TGID, NULL) : -1;
 
     printk(KERN_INFO "KMS| process_vm_writev | PID=%d TGID=%d TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
            pid, tgid, target_pid, local_iov, liovcnt, remote_iov, riovcnt, flags);

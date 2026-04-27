@@ -13,22 +13,29 @@
 #include <kputils.h>
 #include <asm/current.h>
 
-/* 自定义 iovec 结构体，避免依赖 linux/uio.h */
-struct kms_iovec {
-    void __user *iov_base;
-    unsigned long iov_len;
-};
-
-/* 声明需要的内核函数 */
-extern unsigned long copy_from_user(void *to, const void __user *from, unsigned long n);
-extern pid_t task_pid_nr(struct task_struct *task);
-extern pid_t task_tgid_nr(struct task_struct *task);
-
 KPM_NAME("KernelMemorySky");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
 KPM_DESCRIPTION("Interceptor for pread64/pwrite64/process_vm_readv/writev");
+
+/* 动态查找的函数指针 */
+static pid_t (*__task_pid_nr_ns)(struct task_struct *task, enum pid_type type, struct pid_namespace *ns) = NULL;
+
+enum pid_type {
+    PIDTYPE_PID,
+    PIDTYPE_TGID,
+    PIDTYPE_PGID,
+    PIDTYPE_SID,
+    PIDTYPE_MAX,
+};
+struct pid_namespace;
+
+/* 自定义 iovec 结构体 */
+struct kms_iovec {
+    void __user *iov_base;
+    unsigned long iov_len;
+};
 
 /* ---- pread64 (fd, buf, count, pos) ---- */
 static void before_pread64(hook_fargs4_t *fargs, void *udata)
@@ -39,8 +46,8 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
     loff_t pos = (loff_t)syscall_argn(fargs, 3);
 
     struct task_struct *task = current;
-    pid_t pid = task_pid_nr(task);
-    pid_t tgid = task_tgid_nr(task);
+    pid_t pid = __task_pid_nr_ns ? __task_pid_nr_ns(task, PIDTYPE_PID, NULL) : -1;
+    pid_t tgid = __task_pid_nr_ns ? __task_pid_nr_ns(task, PIDTYPE_TGID, NULL) : -1;
 
     printk(KERN_INFO "KMS| pread64 | PID=%d TGID=%d FD=%d BUF=%px COUNT=%zu POS=%lld\n",
            pid, tgid, fd, buf, count, pos);
@@ -48,7 +55,7 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
     if (buf && count > 0) {
         unsigned char tmp[32];
         unsigned long len = count < 32 ? count : 32;
-        if (copy_from_user(tmp, buf, len) == 0) {
+        if (compat_strncpy_from_user(tmp, (const char __user *)buf, len) > 0) {
             printk(KERN_INFO "KMS| pread64 DATA: %*phN\n", (int)len, tmp);
         }
     }
@@ -63,8 +70,8 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
     loff_t pos = (loff_t)syscall_argn(fargs, 3);
 
     struct task_struct *task = current;
-    pid_t pid = task_pid_nr(task);
-    pid_t tgid = task_tgid_nr(task);
+    pid_t pid = __task_pid_nr_ns ? __task_pid_nr_ns(task, PIDTYPE_PID, NULL) : -1;
+    pid_t tgid = __task_pid_nr_ns ? __task_pid_nr_ns(task, PIDTYPE_TGID, NULL) : -1;
 
     printk(KERN_INFO "KMS| pwrite64 | PID=%d TGID=%d FD=%d BUF=%px COUNT=%zu POS=%lld\n",
            pid, tgid, fd, buf, count, pos);
@@ -72,7 +79,7 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
     if (buf && count > 0) {
         unsigned char tmp[32];
         unsigned long len = count < 32 ? count : 32;
-        if (copy_from_user(tmp, buf, len) == 0) {
+        if (compat_strncpy_from_user(tmp, (const char __user *)buf, len) > 0) {
             printk(KERN_INFO "KMS| pwrite64 DATA: %*phN\n", (int)len, tmp);
         }
     }
@@ -89,8 +96,8 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
     unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
 
     struct task_struct *task = current;
-    pid_t pid = task_pid_nr(task);
-    pid_t tgid = task_tgid_nr(task);
+    pid_t pid = __task_pid_nr_ns ? __task_pid_nr_ns(task, PIDTYPE_PID, NULL) : -1;
+    pid_t tgid = __task_pid_nr_ns ? __task_pid_nr_ns(task, PIDTYPE_TGID, NULL) : -1;
 
     printk(KERN_INFO "KMS| process_vm_readv | PID=%d TGID=%d TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
            pid, tgid, target_pid, local_iov, liovcnt, remote_iov, riovcnt, flags);
@@ -98,11 +105,13 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
     if (local_iov && liovcnt > 0) {
         struct kms_iovec __user *local_vec = (struct kms_iovec __user *)local_iov;
         struct kms_iovec vec;
-        if (copy_from_user(&vec, local_vec, sizeof(vec)) == 0 && vec.iov_base && vec.iov_len > 0) {
-            unsigned char tmp[32];
-            unsigned long len = vec.iov_len < 32 ? vec.iov_len : 32;
-            if (copy_from_user(tmp, vec.iov_base, len) == 0) {
-                printk(KERN_INFO "KMS| process_vm_readv DATA(local): %*phN\n", (int)len, tmp);
+        if (compat_strncpy_from_user((char *)&vec, (const char __user *)local_vec, sizeof(vec)) == sizeof(vec)) {
+            if (vec.iov_base && vec.iov_len > 0) {
+                unsigned char tmp[32];
+                unsigned long len = vec.iov_len < 32 ? vec.iov_len : 32;
+                if (compat_strncpy_from_user((char *)tmp, (const char __user *)vec.iov_base, len) > 0) {
+                    printk(KERN_INFO "KMS| process_vm_readv DATA(local): %*phN\n", (int)len, tmp);
+                }
             }
         }
     }
@@ -119,8 +128,8 @@ static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
     unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
 
     struct task_struct *task = current;
-    pid_t pid = task_pid_nr(task);
-    pid_t tgid = task_tgid_nr(task);
+    pid_t pid = __task_pid_nr_ns ? __task_pid_nr_ns(task, PIDTYPE_PID, NULL) : -1;
+    pid_t tgid = __task_pid_nr_ns ? __task_pid_nr_ns(task, PIDTYPE_TGID, NULL) : -1;
 
     printk(KERN_INFO "KMS| process_vm_writev | PID=%d TGID=%d TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
            pid, tgid, target_pid, local_iov, liovcnt, remote_iov, riovcnt, flags);
@@ -128,11 +137,13 @@ static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
     if (local_iov && liovcnt > 0) {
         struct kms_iovec __user *local_vec = (struct kms_iovec __user *)local_iov;
         struct kms_iovec vec;
-        if (copy_from_user(&vec, local_vec, sizeof(vec)) == 0 && vec.iov_base && vec.iov_len > 0) {
-            unsigned char tmp[32];
-            unsigned long len = vec.iov_len < 32 ? vec.iov_len : 32;
-            if (copy_from_user(tmp, vec.iov_base, len) == 0) {
-                printk(KERN_INFO "KMS| process_vm_writev DATA(local): %*phN\n", (int)len, tmp);
+        if (compat_strncpy_from_user((char *)&vec, (const char __user *)local_vec, sizeof(vec)) == sizeof(vec)) {
+            if (vec.iov_base && vec.iov_len > 0) {
+                unsigned char tmp[32];
+                unsigned long len = vec.iov_len < 32 ? vec.iov_len : 32;
+                if (compat_strncpy_from_user((char *)tmp, (const char __user *)vec.iov_base, len) > 0) {
+                    printk(KERN_INFO "KMS| process_vm_writev DATA(local): %*phN\n", (int)len, tmp);
+                }
             }
         }
     }
@@ -141,6 +152,9 @@ static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
 /* ---- 初始化 & 退出 ---- */
 static long init(const char *args, const char *event, void *__user reserved)
 {
+    __task_pid_nr_ns = (typeof(__task_pid_nr_ns))kallsyms_lookup_name("__task_pid_nr_ns");
+    pr_info("KMS: __task_pid_nr_ns addr: %px\n", __task_pid_nr_ns);
+
     hook_err_t err;
 
     err = fp_hook_syscalln(__NR_pread64, 4, before_pread64, 0, 0);

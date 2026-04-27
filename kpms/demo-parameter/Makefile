@@ -18,7 +18,7 @@ objs := parameter.o
 
 all: parameter.kpm
 
-paremeter.kpm: ${objs}
+parameter.kpm: ${objs}
         ${CC} -r -o $@ $^
 
 %.o: %.c

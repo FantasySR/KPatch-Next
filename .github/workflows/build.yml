@@ -53,13 +53,13 @@ jobs:
           make
           mv hello.kpm demo-hello.kpm
 
-          cd ../demo-parameter
-          make
-          mv parameter.kpm demo-parameter.kpm
-
           cd ../demo-inlinehook
           make
           mv inlinehook.kpm demo-inlinehook.kpm
+
+          cd ../demo-parameter
+          make
+          mv parameter.kpm demo-parameter.kpm
 
           cd ../demo-syscallhook
           make
@@ -84,8 +84,8 @@ jobs:
           artifacts: |
             kernel/kpimg-linux
             kpms/demo-hello/demo-hello.kpm
-            kpms/demo-parameter/demo-parameter.kpm
             kpms/demo-inlinehook/demo-inlinehook.kpm
+            kpms/demo-parameter/demo-parameter.kpm
             kpms/demo-syscallhook/demo-syscallhook.kpm
             kpms/kms-interceptr/release-interceptr.kpm
           generateReleaseNotes: true

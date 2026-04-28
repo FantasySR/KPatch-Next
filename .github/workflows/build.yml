@@ -49,7 +49,11 @@ jobs:
           cd ..
           cd kpms
 
-          cd demo-hello
+          cd demo-device
+          make
+          mv device.kpm demo-device.kpm
+
+          cd ../demo-hello
           make
           mv hello.kpm demo-hello.kpm
 
@@ -83,6 +87,7 @@ jobs:
           tag: ${{ steps.parse_version.outputs.VERSION }}
           artifacts: |
             kernel/kpimg-linux
+            kpms/demo-device/demo-device.kpm
             kpms/demo-hello/demo-hello.kpm
             kpms/demo-inlinehook/demo-inlinehook.kpm
             kpms/demo-parameter/demo-parameter.kpm

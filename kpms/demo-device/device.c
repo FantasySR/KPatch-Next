@@ -112,7 +112,7 @@ static long init(const char *args, const char *event, void *__user reserved) {
     }
 
     // 获取 copy_to_user
-    copy_to_user_ptr = (copy_to_user_t)kallsyms_lookup_name("__arch_copy_to_user");
+    copy_to_user_ptr = (copy_to_user_t)kallsyms_lookup_name("copy_to_user_nofault");
     if (!copy_to_user_ptr) {
         printk(KERN_WARNING "DeviceTest: copy_to_user not found, read will return 0\n");
     }

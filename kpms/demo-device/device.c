@@ -3,172 +3,89 @@
 #include <kpmodule.h>
 #include <linux/printk.h>
 #include <linux/string.h>
-#include <linux/uaccess.h>
-#include <linux/fs.h>
 #include <linux/slab.h>
+#include <linux/fs.h>
 
 KPM_NAME("DeviceTest");
-KPM_VERSION("1.0.0");
+KPM_VERSION("1.1.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Device with put_user read");
+KPM_DESCRIPTION("Ring buffer + CTL0 read test");
 
-#ifndef EFAULT
-#define EFAULT 14
-#endif
-#ifndef ENOMEM
-#define ENOMEM 12
-#endif
+#define BUF_SIZE (1024 * 64)  // 64KB
+static char *rbuf = NULL;
+static int rhead = 0, rtail = 0, rcount = 0;
 
-/* 完整的 file_operations 定义 */
-struct file_operations {
-    struct module *owner;
-    loff_t (*llseek) (struct file *, loff_t, int);
-    ssize_t (*read) (struct file *, char __user *, size_t, loff_t *);
-    ssize_t (*write) (struct file *, const char __user *, size_t, loff_t *);
-    ssize_t (*read_iter) (struct kiocb *, struct iov_iter *);
-    ssize_t (*write_iter) (struct kiocb *, struct iov_iter *);
-    int (*iopoll)(struct kiocb *kiocb, bool spin);
-    int (*iterate) (struct file *, struct dir_context *);
-    int (*iterate_shared) (struct file *, struct dir_context *);
-    __poll_t (*poll) (struct file *, struct poll_table_struct *);
-    long (*unlocked_ioctl) (struct file *, unsigned int, unsigned long);
-    long (*compat_ioctl) (struct file *, unsigned int, unsigned long);
-    int (*mmap) (struct file *, struct vm_area_struct *);
-    unsigned long mmap_supported_flags;
-    int (*open) (struct inode *, struct file *);
-    int (*flush) (struct file *, fl_owner_t id);
-    int (*release) (struct inode *, struct file *);
-    int (*fsync) (struct file *, loff_t, loff_t, int datasync);
-    int (*fasync) (int, struct file *, int);
-    int (*lock) (struct file *, int, struct file_lock *);
-    ssize_t (*sendpage) (struct file *, struct page *, int, size_t, loff_t *, int);
-    unsigned long (*get_unmapped_area)(struct file *, unsigned long, unsigned long, unsigned long, unsigned long);
-    int (*check_flags)(int);
-    int (*flock) (struct file *, int, struct file_lock *);
-    ssize_t (*splice_write)(struct pipe_inode_info *, struct file *, loff_t *, size_t, unsigned int);
-    ssize_t (*splice_read)(struct file *, loff_t *, struct pipe_inode_info *, size_t, unsigned int);
-    int (*setlease)(struct file *, long, struct file_lock **, void **);
-    long (*fallocate)(struct file *file, int mode, loff_t offset, loff_t len);
-    void (*show_fdinfo)(struct seq_file *m, struct file *f);
-    ssize_t (*copy_file_range)(struct file *, loff_t, struct file *, loff_t, size_t, unsigned int);
-    loff_t (*remap_file_range)(struct file *file_in, loff_t pos_in, struct file *file_out, loff_t pos_out, loff_t len, unsigned int remap_flags);
-    int (*fadvise)(struct file *, loff_t, loff_t, int);
-} __randomize_layout;
-
-struct miscdevice {
-    int minor;
-    const char *name;
-    const struct file_operations *fops;
-    struct list_head list;
-    struct device *parent;
-    struct device *this_device;
-    const struct attribute_group **groups;
-    const char *nodename;
-    umode_t mode;
-};
-
-/* ---- 读操作：逐字节 put_user，绝对可靠 ---- */
-static ssize_t dev_read(struct file *file, char __user *buf, size_t len, loff_t *off) {
-    const char *msg = "KMS active\n";
-    size_t msg_len = strlen(msg);
-    if (*off >= msg_len) return 0;
-    size_t to_copy = (len < msg_len - *off) ? len : (msg_len - *off);
-    size_t i;
-    for (i = 0; i < to_copy; i++) {
-        if (put_user(msg[*off + i], buf + i))
-            return -EFAULT;
+/* 写入环形缓冲区（供拦截器后续调用） */
+static void ring_write(const char *data, int len) {
+    for (int i = 0; i < len; i++) {
+        rbuf[rhead] = data[i];
+        rhead = (rhead + 1) % BUF_SIZE;
+        if (rcount < BUF_SIZE) rcount++;
     }
-    *off += to_copy;
-    return to_copy;
 }
 
-static int dev_open(struct inode *inode, struct file *file) { return 0; }
-static int dev_release(struct inode *inode, struct file *file) { return 0; }
-
-static struct file_operations fops = {
-    .owner = NULL,
-    .llseek = NULL,
-    .read = dev_read,
-    .write = NULL,
-    .read_iter = NULL,
-    .write_iter = NULL,
-    .iopoll = NULL,
-    .iterate = NULL,
-    .iterate_shared = NULL,
-    .poll = NULL,
-    .unlocked_ioctl = NULL,
-    .compat_ioctl = NULL,
-    .mmap = NULL,
-    .mmap_supported_flags = 0,
-    .open = dev_open,
-    .flush = NULL,
-    .release = dev_release,
-    .fsync = NULL,
-    .fasync = NULL,
-    .lock = NULL,
-    .sendpage = NULL,
-    .get_unmapped_area = NULL,
-    .check_flags = NULL,
-    .flock = NULL,
-    .splice_write = NULL,
-    .splice_read = NULL,
-    .setlease = NULL,
-    .fallocate = NULL,
-    .show_fdinfo = NULL,
-    .copy_file_range = NULL,
-    .remap_file_range = NULL,
-    .fadvise = NULL,
-};
-
-static struct miscdevice dev_misc = {
-    .minor = 255,
-    .name = "kms_intercept",
-    .fops = &fops,
-};
-
-/* ---- CTL0 控制 ---- */
+/* CTL0 控制：支持 read 命令读取缓冲区内容 */
 static long ct0_handler(const char *args, char *__user out_msg, int outlen) {
     if (!args) {
         if (out_msg && outlen > 0) strncpy(out_msg, "no cmd", outlen);
         return 0;
     }
-    if (strcmp(args, "run") == 0) {
-        printk(KERN_INFO "KMS: run command received\n");
-        if (out_msg && outlen > 0) strncpy(out_msg, "running", outlen);
-    } else if (strcmp(args, "stop") == 0) {
-        printk(KERN_INFO "KMS: stop command received\n");
-        if (out_msg && outlen > 0) strncpy(out_msg, "stopped", outlen);
-    } else {
-        printk(KERN_INFO "KMS: unknown command: %s\n", args);
-        if (out_msg && outlen > 0) strncpy(out_msg, "unknown", outlen);
+    if (strcmp(args, "read") == 0) {
+        if (!rbuf || !out_msg || outlen <= 0) return 0;
+        int avail = rcount;
+        if (avail == 0) {
+            strncpy(out_msg, "(empty)", outlen);
+            return 0;
+        }
+        int to_copy = (outlen - 1 < avail) ? (outlen - 1) : avail;
+        int i;
+        for (i = 0; i < to_copy; i++) {
+            out_msg[i] = rbuf[(rtail + i) % BUF_SIZE];
+        }
+        out_msg[to_copy] = '\0';
+        rtail = (rtail + to_copy) % BUF_SIZE;
+        rcount -= to_copy;
+        return 0;
     }
+    if (strcmp(args, "test") == 0) {
+        // 写入测试数据
+        ring_write("Hello from ring buffer!\n", 23);
+        if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
+        return 0;
+    }
+    if (out_msg && outlen > 0) strncpy(out_msg, "unknown", outlen);
     return 0;
 }
 
-typedef int (*misc_register_t)(struct miscdevice *);
-typedef void (*misc_deregister_t)(struct miscdevice *);
-static misc_register_t misc_reg = NULL;
-static misc_deregister_t misc_dereg = NULL;
+/* 动态获取 kmalloc/kfree */
+typedef void *(*kmalloc_t)(size_t, gfp_t);
+typedef void (*kfree_t)(const void *);
+static kmalloc_t kmalloc_ptr = NULL;
+static kfree_t kfree_ptr = NULL;
+
+#ifndef GFP_KERNEL
+#define GFP_KERNEL 0xcc0U
+#endif
 
 static long init(const char *args, const char *event, void *__user reserved) {
-    misc_reg = (misc_register_t)kallsyms_lookup_name("misc_register");
-    misc_dereg = (misc_deregister_t)kallsyms_lookup_name("misc_deregister");
-    if (!misc_reg || !misc_dereg) {
-        printk(KERN_ERR "DeviceTest: misc symbols not found\n");
+    kmalloc_ptr = (kmalloc_t)kallsyms_lookup_name("kmalloc");
+    kfree_ptr = (kfree_t)kallsyms_lookup_name("kfree");
+    if (!kmalloc_ptr || !kfree_ptr) {
+        printk(KERN_ERR "DeviceTest: kmalloc/kfree not found\n");
         return -1;
     }
-    int ret = misc_reg(&dev_misc);
-    if (ret < 0) {
-        printk(KERN_ERR "DeviceTest: register failed %d\n", ret);
-        return ret;
+    rbuf = kmalloc_ptr(BUF_SIZE, GFP_KERNEL);
+    if (!rbuf) {
+        printk(KERN_ERR "DeviceTest: buffer alloc failed\n");
+        return -ENOMEM;
     }
-    printk(KERN_INFO "DeviceTest: /dev/%s ready\n", dev_misc.name);
+    printk(KERN_INFO "DeviceTest: ring buffer ready\n");
     return 0;
 }
 
 static long exit(void *__user reserved) {
-    if (misc_dereg) misc_dereg(&dev_misc);
+    if (rbuf && kfree_ptr) kfree_ptr(rbuf);
     printk(KERN_INFO "DeviceTest: unloaded\n");
     return 0;
 }

@@ -3,23 +3,15 @@
 #include <kpmodule.h>
 #include <linux/printk.h>
 #include <linux/string.h>
-#include <linux/slab.h>
 
 KPM_NAME("DeviceTest");
-KPM_VERSION("1.1.1");
+KPM_VERSION("1.1.3");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Ring buffer + CTL0 read test");
-
-#ifndef ENOMEM
-#define ENOMEM 12
-#endif
-#ifndef GFP_KERNEL
-#define GFP_KERNEL 0xcc0U
-#endif
+KPM_DESCRIPTION("Static ring buffer + CTL0 read");
 
 #define BUF_SIZE (1024 * 64)  // 64KB
-static char *rbuf = NULL;
+static char rbuf[BUF_SIZE];
 static int rhead = 0, rtail = 0, rcount = 0;
 
 static void ring_write(const char *data, int len) {
@@ -36,7 +28,7 @@ static long ct0_handler(const char *args, char *__user out_msg, int outlen) {
         return 0;
     }
     if (strcmp(args, "read") == 0) {
-        if (!rbuf || !out_msg || outlen <= 0) return 0;
+        if (!out_msg || outlen <= 0) return 0;
         int avail = rcount;
         if (avail == 0) {
             strncpy(out_msg, "(empty)", outlen);
@@ -61,29 +53,12 @@ static long ct0_handler(const char *args, char *__user out_msg, int outlen) {
     return 0;
 }
 
-typedef void *(*kmalloc_t)(size_t, gfp_t);
-typedef void (*kfree_t)(const void *);
-static kmalloc_t kmalloc_ptr = NULL;
-static kfree_t kfree_ptr = NULL;
-
 static long init(const char *args, const char *event, void *__user reserved) {
-    kmalloc_ptr = (kmalloc_t)kallsyms_lookup_name("kmalloc");
-    kfree_ptr = (kfree_t)kallsyms_lookup_name("kfree");
-    if (!kmalloc_ptr || !kfree_ptr) {
-        printk(KERN_ERR "DeviceTest: kmalloc/kfree not found\n");
-        return -1;
-    }
-    rbuf = kmalloc_ptr(BUF_SIZE, GFP_KERNEL);
-    if (!rbuf) {
-        printk(KERN_ERR "DeviceTest: buffer alloc failed\n");
-        return -ENOMEM;
-    }
-    printk(KERN_INFO "DeviceTest: ring buffer ready\n");
+    printk(KERN_INFO "DeviceTest: static buffer ready\n");
     return 0;
 }
 
 static long dev_exit(void *__user reserved) {
-    if (rbuf && kfree_ptr) kfree_ptr(rbuf);
     printk(KERN_INFO "DeviceTest: unloaded\n");
     return 0;
 }

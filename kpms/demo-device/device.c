@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * 设备文件测试 - 动态符号只读安全版
+ * 设备文件测试 - put_user 安全版
  */
 
 #include <compiler.h>
@@ -11,12 +11,11 @@
 #include <linux/fs.h>
 
 KPM_NAME("DeviceTest");
-KPM_VERSION("0.9.2");
+KPM_VERSION("0.9.3");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Safe read-only device with dynamic symbols");
+KPM_DESCRIPTION("Safe read-only device using put_user");
 
-/* 手动补充宏 */
 #ifndef EFAULT
 #define EFAULT 14
 #endif
@@ -41,10 +40,6 @@ struct file_operations {
     int (*release)(struct inode *, struct file *);
 };
 
-/* 动态获取的函数指针 */
-typedef unsigned long (*copy_to_user_t)(void __user *, const void *, unsigned long);
-static copy_to_user_t copy_to_user_ptr = NULL;
-
 /* ---- 设备操作 ---- */
 static int dev_open(struct inode *inode, struct file *file) { return 0; }
 static int dev_release(struct inode *inode, struct file *file) { return 0; }
@@ -53,12 +48,13 @@ static ssize_t dev_read(struct file *file, char __user *buf, size_t len, loff_t 
     const char *msg = "KMS active\n";
     size_t msg_len = strlen(msg);
     if (*off >= msg_len) return 0;
+
+    size_t i = 0;
     size_t to_copy = (len < msg_len - *off) ? len : (msg_len - *off);
-    if (copy_to_user_ptr) {
-        if (copy_to_user_ptr(buf, msg + *off, to_copy)) return -EFAULT;
-    } else {
-        // 如果没获取到函数，直接返回 0，避免崩溃
-        return 0;
+    for (i = 0; i < to_copy; i++) {
+        if (put_user(msg[*off + i], buf + i)) {
+            return -EFAULT;
+        }
     }
     *off += to_copy;
     return to_copy;
@@ -103,18 +99,11 @@ static misc_register_t misc_reg = NULL;
 static misc_deregister_t misc_dereg = NULL;
 
 static long init(const char *args, const char *event, void *__user reserved) {
-    // 获取 misc 函数
     misc_reg = (misc_register_t)kallsyms_lookup_name("misc_register");
     misc_dereg = (misc_deregister_t)kallsyms_lookup_name("misc_deregister");
     if (!misc_reg || !misc_dereg) {
         printk(KERN_ERR "DeviceTest: misc symbols not found\n");
         return -1;
-    }
-
-    // 获取 copy_to_user
-    copy_to_user_ptr = (copy_to_user_t)kallsyms_lookup_name("copy_to_user_nofault");
-    if (!copy_to_user_ptr) {
-        printk(KERN_WARNING "DeviceTest: copy_to_user not found, read will return 0\n");
     }
 
     int ret = misc_reg(&dev_misc);

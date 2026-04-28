@@ -1,11 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * KernelMemorySky - 集成版拦截器（修正头文件）
- * 功能:
- * - Hook pread64, pwrite64, process_vm_readv, process_vm_writev
- * - PID 过滤（process_vm 按目标 PID，pread64/pwrite64 全量输出）
- * - 日志同时写入环形缓冲区和 dmesg
- * - CTL0 命令: run, stop, pid=XXX, read, off
+ * KernelMemorySky - 集成版拦截器（无格式化依赖）
  */
 
 #include <compiler.h>
@@ -16,16 +11,15 @@
 #include <linux/string.h>
 #include <kputils.h>
 #include <asm/current.h>
-#include <stdarg.h>   // <-- 添加这个头文件
 
 KPM_NAME("KernelMemorySky");
-KPM_VERSION("3.0.1");
+KPM_VERSION("3.0.2");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Integrated interceptor with ring buffer + CTL0");
+KPM_DESCRIPTION("Integrated interceptor (safe)");
 
 /* ---------- 环形缓冲区 ---------- */
-#define BUF_SIZE (1024 * 64)           // 64KB
+#define BUF_SIZE (1024 * 64)
 static char ring_buf[BUF_SIZE];
 static int ring_head = 0, ring_tail = 0, ring_count = 0;
 
@@ -37,22 +31,9 @@ static void ring_write(const char *data, int len) {
     }
 }
 
-/* 简化版格式化写入 */
-static void log_to_ring_and_dmesg(const char *fmt, ...) {
-    char buf[256];
-    va_list args;
-    va_start(args, fmt);
-    int len = vsnprintf(buf, sizeof(buf), fmt, args);
-    va_end(args);
-    if (len > 0) {
-        ring_write(buf, len);
-        printk(KERN_INFO "KMS| %s", buf);
-    }
-}
-
 /* ---------- PID 过滤变量 ---------- */
 static int target_pid = 0;
-static int running = 1;    // run/stop 控制
+static int running = 1;
 
 /* ---------- CTL0 命令处理 ---------- */
 static long interceptor_control0(const char *args, char *__user out_msg, int outlen) {
@@ -63,11 +44,13 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
 
     if (strcmp(args, "run") == 0) {
         running = 1;
-        log_to_ring_and_dmesg("STATUS: running\n");
+        ring_write("run\n", 4);
+        printk(KERN_INFO "KMS: run\n");
         if (out_msg && outlen > 0) strncpy(out_msg, "running", outlen);
     } else if (strcmp(args, "stop") == 0) {
         running = 0;
-        log_to_ring_and_dmesg("STATUS: stopped\n");
+        ring_write("stop\n", 5);
+        printk(KERN_INFO "KMS: stop\n");
         if (out_msg && outlen > 0) strncpy(out_msg, "stopped", outlen);
     } else if (strncmp(args, "pid=", 4) == 0) {
         const char *p = args + 4;
@@ -78,11 +61,11 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
             return -EINVAL;
         }
         target_pid = pid;
-        log_to_ring_and_dmesg("PID filter set to %d\n", target_pid);
+        printk(KERN_INFO "KMS: PID filter %d\n", target_pid);
         if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
     } else if (strcmp(args, "off") == 0) {
         target_pid = 0;
-        log_to_ring_and_dmesg("PID filter off\n");
+        printk(KERN_INFO "KMS: PID filter off\n");
         if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
     } else if (strcmp(args, "read") == 0) {
         if (!out_msg || outlen <= 0) return 0;
@@ -103,14 +86,15 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
     return 0;
 }
 
-/* ---------- Hook 回调 ---------- */
+/* ---------- Hook 回调（详细日志用 printk，环形缓冲区只写标签）---------- */
 static void before_pread64(hook_fargs4_t *fargs, void *udata) {
     if (!running) return;
     int fd = (int)syscall_argn(fargs, 0);
     void __user *buf = (void __user *)syscall_argn(fargs, 1);
     size_t count = (size_t)syscall_argn(fargs, 2);
     loff_t pos = (loff_t)syscall_argn(fargs, 3);
-    log_to_ring_and_dmesg("pread64 FD=%d BUF=%px COUNT=%zu POS=%lld\n", fd, buf, count, pos);
+    printk(KERN_INFO "KMS| pread64 FD=%d BUF=%px COUNT=%zu POS=%lld\n", fd, buf, count, pos);
+    ring_write("pread64\n", 8);
 }
 
 static void before_pwrite64(hook_fargs4_t *fargs, void *udata) {
@@ -119,7 +103,8 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata) {
     const void __user *buf = (const void __user *)syscall_argn(fargs, 1);
     size_t count = (size_t)syscall_argn(fargs, 2);
     loff_t pos = (loff_t)syscall_argn(fargs, 3);
-    log_to_ring_and_dmesg("pwrite64 FD=%d BUF=%px COUNT=%zu POS=%lld\n", fd, buf, count, pos);
+    printk(KERN_INFO "KMS| pwrite64 FD=%d BUF=%px COUNT=%zu POS=%lld\n", fd, buf, count, pos);
+    ring_write("pwrite64\n", 9);
 }
 
 static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata) {
@@ -131,8 +116,9 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata) {
     void __user *remote_iov = (void __user *)syscall_argn(fargs, 3);
     unsigned long riovcnt = (unsigned long)syscall_argn(fargs, 4);
     unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
-    log_to_ring_and_dmesg("process_vm_readv TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
-                          tpid, local_iov, liovcnt, remote_iov, riovcnt, flags);
+    printk(KERN_INFO "KMS| process_vm_readv TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
+           tpid, local_iov, liovcnt, remote_iov, riovcnt, flags);
+    ring_write("vm_readv\n", 9);
 }
 
 static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata) {
@@ -144,8 +130,9 @@ static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata) {
     void __user *remote_iov = (void __user *)syscall_argn(fargs, 3);
     unsigned long riovcnt = (unsigned long)syscall_argn(fargs, 4);
     unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
-    log_to_ring_and_dmesg("process_vm_writev TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
-                          tpid, local_iov, liovcnt, remote_iov, riovcnt, flags);
+    printk(KERN_INFO "KMS| process_vm_writev TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
+           tpid, local_iov, liovcnt, remote_iov, riovcnt, flags);
+    ring_write("vm_writev\n", 10);
 }
 
 /* ---------- 模块初始化 ---------- */
@@ -160,7 +147,8 @@ static long init(const char *args, const char *event, void *__user reserved) {
     err = fp_hook_syscalln(__NR_process_vm_writev, 6, before_process_vm_writev, 0, 0);
     if (err) printk(KERN_ERR "KMS: hook process_vm_writev fail %d\n", err);
 
-    log_to_ring_and_dmesg("Interceptor loaded (ring buffer ready)\n");
+    ring_write("loaded\n", 7);
+    printk(KERN_INFO "KMS: Interceptor loaded (ring buffer ready)\n");
     return 0;
 }
 

@@ -35,7 +35,7 @@ static int (*f_setown_ptr)(struct file *, pid_t, int) = NULL;
 static int target_pid = 0;
 static int owner_pid_offset = 0x98;   // 默认偏移，可通过 ofs= 调整
 
-/* ---- CTL0 控制接口（支持 setowner, ofs, PID, off）---- */
+/* ---- CTL0 控制接口（支持 so, ofs=, PID, off）---- */
 static long interceptor_control0(const char *args, char *__user out_msg, int outlen)
 {
     if (!args) {
@@ -48,34 +48,29 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
         return 0;
     }
 
-    /* setowner <pid>：为目标进程的所有 fd 设置 f_owner */
-    if (strncmp(args, "setowner ", 9) == 0) {
-        if (!f_setown_ptr || !fget_ptr || !fput_ptr) {
-            if (out_msg && outlen > 0) strncpy(out_msg, "err: no f_setown", outlen);
-            return -ENOSYS;
-        }
-
-        int owner_pid = 0;
-        const char *p = args + 9;
-        if (*p == '-') {
+    /* so<pid>：为目标进程的所有 fd 设置 f_owner */
+    if (strncmp(args, "so", 2) == 0) {
+        const char *p = args + 2;
+        if (*p < '0' || *p > '9') {
             if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
             return -EINVAL;
         }
+
+        int owner_pid = 0;
         while (*p >= '0' && *p <= '9') {
             owner_pid = owner_pid * 10 + (*p - '0');
             p++;
         }
-        if (*p != '\0' || owner_pid <= 0) {
+        if (owner_pid <= 0) {
             if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
             return -EINVAL;
         }
 
-        // 遍历目标进程的 fd 表（简单粗暴：循环所有可能的 fd 直到 fget 返回 NULL）
         int fd;
         for (fd = 0; fd < 1024; fd++) {
             struct file *filp = fget_ptr(fd);
-            if (!filp) continue; // fd 不存在
-            f_setown_ptr(filp, owner_pid, 0); // 设置 f_owner.pid
+            if (!filp) continue;
+            f_setown_ptr(filp, owner_pid, 0);
             fput_ptr(filp);
         }
 

@@ -8,10 +8,10 @@
 #include <linux/slab.h>
 
 KPM_NAME("DeviceTest");
-KPM_VERSION("0.9.4");
+KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Last attempt with full fops");
+KPM_DESCRIPTION("Device with put_user read");
 
 #ifndef EFAULT
 #define EFAULT 14
@@ -20,7 +20,7 @@ KPM_DESCRIPTION("Last attempt with full fops");
 #define ENOMEM 12
 #endif
 
-/* 尽可能完整的 file_operations 结构体定义（基于 Linux 5.15 ARM64） */
+/* 完整的 file_operations 定义 */
 struct file_operations {
     struct module *owner;
     loff_t (*llseek) (struct file *, loff_t, int);
@@ -68,37 +68,23 @@ struct miscdevice {
     umode_t mode;
 };
 
-/* 动态函数指针 */
-typedef unsigned long (*copy_to_user_t)(void __user *, const void *, unsigned long);
-static copy_to_user_t copy_to_user_ptr = NULL;
-
+/* ---- 读操作：逐字节 put_user，绝对可靠 ---- */
 static ssize_t dev_read(struct file *file, char __user *buf, size_t len, loff_t *off) {
-    printk(KERN_INFO "DeviceTest: dev_read called\n");
     const char *msg = "KMS active\n";
     size_t msg_len = strlen(msg);
     if (*off >= msg_len) return 0;
     size_t to_copy = (len < msg_len - *off) ? len : (msg_len - *off);
-    if (copy_to_user_ptr) {
-        if (copy_to_user_ptr(buf, msg + *off, to_copy)) {
-            printk(KERN_INFO "DeviceTest: copy_to_user failed\n");
+    size_t i;
+    for (i = 0; i < to_copy; i++) {
+        if (put_user(msg[*off + i], buf + i))
             return -EFAULT;
-        }
-    } else {
-        printk(KERN_INFO "DeviceTest: copy_to_user_ptr is NULL\n");
-        return 0;
     }
     *off += to_copy;
     return to_copy;
 }
 
-static int dev_open(struct inode *inode, struct file *file) {
-    printk(KERN_INFO "DeviceTest: open called\n");
-    return 0;
-}
-static int dev_release(struct inode *inode, struct file *file) {
-    printk(KERN_INFO "DeviceTest: release called\n");
-    return 0;
-}
+static int dev_open(struct inode *inode, struct file *file) { return 0; }
+static int dev_release(struct inode *inode, struct file *file) { return 0; }
 
 static struct file_operations fops = {
     .owner = NULL,
@@ -141,7 +127,7 @@ static struct miscdevice dev_misc = {
     .fops = &fops,
 };
 
-/* CTL0 控制 */
+/* ---- CTL0 控制 ---- */
 static long ct0_handler(const char *args, char *__user out_msg, int outlen) {
     if (!args) {
         if (out_msg && outlen > 0) strncpy(out_msg, "no cmd", outlen);
@@ -172,17 +158,11 @@ static long init(const char *args, const char *event, void *__user reserved) {
         printk(KERN_ERR "DeviceTest: misc symbols not found\n");
         return -1;
     }
-    copy_to_user_ptr = (copy_to_user_t)kallsyms_lookup_name("copy_to_user_nofault");
-    if (!copy_to_user_ptr) {
-        printk(KERN_WARNING "DeviceTest: copy_to_user_nofault not found, read disabled\n");
-    }
-
     int ret = misc_reg(&dev_misc);
     if (ret < 0) {
         printk(KERN_ERR "DeviceTest: register failed %d\n", ret);
         return ret;
     }
-
     printk(KERN_INFO "DeviceTest: /dev/%s ready\n", dev_misc.name);
     return 0;
 }

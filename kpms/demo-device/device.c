@@ -4,19 +4,24 @@
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <linux/slab.h>
-#include <linux/fs.h>
 
 KPM_NAME("DeviceTest");
-KPM_VERSION("1.1.0");
+KPM_VERSION("1.1.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
 KPM_DESCRIPTION("Ring buffer + CTL0 read test");
+
+#ifndef ENOMEM
+#define ENOMEM 12
+#endif
+#ifndef GFP_KERNEL
+#define GFP_KERNEL 0xcc0U
+#endif
 
 #define BUF_SIZE (1024 * 64)  // 64KB
 static char *rbuf = NULL;
 static int rhead = 0, rtail = 0, rcount = 0;
 
-/* 写入环形缓冲区（供拦截器后续调用） */
 static void ring_write(const char *data, int len) {
     for (int i = 0; i < len; i++) {
         rbuf[rhead] = data[i];
@@ -25,7 +30,6 @@ static void ring_write(const char *data, int len) {
     }
 }
 
-/* CTL0 控制：支持 read 命令读取缓冲区内容 */
 static long ct0_handler(const char *args, char *__user out_msg, int outlen) {
     if (!args) {
         if (out_msg && outlen > 0) strncpy(out_msg, "no cmd", outlen);
@@ -49,7 +53,6 @@ static long ct0_handler(const char *args, char *__user out_msg, int outlen) {
         return 0;
     }
     if (strcmp(args, "test") == 0) {
-        // 写入测试数据
         ring_write("Hello from ring buffer!\n", 23);
         if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
         return 0;
@@ -58,15 +61,10 @@ static long ct0_handler(const char *args, char *__user out_msg, int outlen) {
     return 0;
 }
 
-/* 动态获取 kmalloc/kfree */
 typedef void *(*kmalloc_t)(size_t, gfp_t);
 typedef void (*kfree_t)(const void *);
 static kmalloc_t kmalloc_ptr = NULL;
 static kfree_t kfree_ptr = NULL;
-
-#ifndef GFP_KERNEL
-#define GFP_KERNEL 0xcc0U
-#endif
 
 static long init(const char *args, const char *event, void *__user reserved) {
     kmalloc_ptr = (kmalloc_t)kallsyms_lookup_name("kmalloc");
@@ -84,12 +82,12 @@ static long init(const char *args, const char *event, void *__user reserved) {
     return 0;
 }
 
-static long exit(void *__user reserved) {
+static long dev_exit(void *__user reserved) {
     if (rbuf && kfree_ptr) kfree_ptr(rbuf);
     printk(KERN_INFO "DeviceTest: unloaded\n");
     return 0;
 }
 
 KPM_INIT(init);
-KPM_EXIT(exit);
+KPM_EXIT(dev_exit);
 KPM_CTL0(ct0_handler);

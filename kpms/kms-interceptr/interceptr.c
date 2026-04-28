@@ -2,7 +2,7 @@
 /*
  * KernelMemorySky - System Call Interceptor
  * Hooks: pread64, pwrite64, process_vm_readv, process_vm_writev
- * PID filter using target pid for VM calls, and f_owner for file calls
+ * PID filter for file calls via f_owner (default offset 0x98)
  */
 
 #include <compiler.h>
@@ -15,10 +15,10 @@
 #include <asm/current.h>
 
 KPM_NAME("KernelMemorySky");
-KPM_VERSION("1.3.0");
+KPM_VERSION("1.4.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("PID filter for file + VM calls via f_owner");
+KPM_DESCRIPTION("PID filter with adjustable f_owner offset");
 
 /* 自定义 iovec */
 struct kms_iovec {
@@ -26,55 +26,15 @@ struct kms_iovec {
     unsigned long iov_len;
 };
 
-/* 全局 PID 过滤变量 */
-static int target_pid = 0;
-static int owner_pid_offset = -1;   // f_owner.pid 在 struct file 中的偏移量
-
-/* 前向声明 fget，由 kallsyms 动态获取 */
+/* 缺失的外部函数声明 */
+extern void fput(struct file *);
 static struct file *(*fget_ptr)(unsigned int fd) = NULL;
 
-/* ---- 动态偏移量检测 ---- */
-static void detect_fowner_offset(void)
-{
-    struct file *filp;
-    int i;
+/* 全局变量 */
+static int target_pid = 0;
+static int owner_pid_offset = 0x98;   // ARM64 常见 f_owner.pid 偏移，可调
 
-    fget_ptr = (typeof(fget_ptr))kallsyms_lookup_name("fget");
-    if (!fget_ptr) {
-        pr_warn("KMS: fget not found, file PID filter disabled\n");
-        owner_pid_offset = -1;
-        return;
-    }
-
-    /* 打开 fd 0 获取一个有效的 struct file 指针 */
-    filp = fget_ptr(0);
-    if (!filp) {
-        pr_warn("KMS: cannot open fd 0, file PID filter disabled\n");
-        owner_pid_offset = -1;
-        return;
-    }
-
-    /* 扫描 file 结构体附近内存，寻找当前进程的 TGID */
-    pid_t my_tgid = current->tgid; // 进程的主线程 PID
-    unsigned int *ptr = (unsigned int *)((unsigned long)filp + 0x60);
-    unsigned int *end = (unsigned int *)((unsigned long)filp + 0x130);
-
-    for (i = 0; ptr < end; ptr += 1) {
-        if (*ptr == my_tgid) {
-            owner_pid_offset = (unsigned long)ptr - (unsigned long)filp;
-            pr_info("KMS: detected f_owner.pid offset = %d\n", owner_pid_offset);
-            fput(filp);
-            return;
-        }
-    }
-
-    /* 未找到，使用常见的 ARM64 默认值 */
-    owner_pid_offset = 0x98;
-    pr_info("KMS: using default f_owner.pid offset %d\n", owner_pid_offset);
-    fput(filp);
-}
-
-/* ---- CTL0 控制接口（不变）---- */
+/* ---- CTL0 控制接口（支持 offset 设置）---- */
 static long interceptor_control0(const char *args, char *__user out_msg, int outlen)
 {
     if (!args) {
@@ -87,14 +47,34 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
         return 0;
     }
 
-    if (strcmp(args, "off") == 0) {
-        target_pid = 0;
-        printk(KERN_INFO "KMS: PID filter disabled\n");
-        if (out_msg && outlen > 0)
-            strncpy(out_msg, "ok", outlen);
+    /* 设置偏移量命令: ofs=0xA0 */
+    if (strncmp(args, "ofs=", 4) == 0) {
+        const char *p = args + 4;
+        if (*p == '0' && (*(p+1) == 'x' || *(p+1) == 'X')) p += 2;
+        int new_ofs = 0;
+        while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) {
+            new_ofs = (new_ofs << 4) + (*p >= 'A' ? ((*p & 0xDF) - 'A' + 10) : (*p - '0'));
+            p++;
+        }
+        if (*p != '\0') {
+            if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
+            return -EINVAL;
+        }
+        owner_pid_offset = new_ofs;
+        printk(KERN_INFO "KMS: f_owner offset set to 0x%x\n", owner_pid_offset);
+        if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
         return 0;
     }
 
+    /* 关闭过滤 */
+    if (strcmp(args, "off") == 0) {
+        target_pid = 0;
+        printk(KERN_INFO "KMS: PID filter disabled\n");
+        if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
+        return 0;
+    }
+
+    /* 设置 PID */
     int pid = 0;
     const char *p = args;
     if (*p == '-') {
@@ -111,8 +91,7 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
     }
     target_pid = pid;
     printk(KERN_INFO "KMS: PID filter set to %d\n", target_pid);
-    if (out_msg && outlen > 0)
-        strncpy(out_msg, "ok", outlen);
+    if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
     return 0;
 }
 
@@ -127,7 +106,6 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
     pid_t owner_pid = -1;
     struct file *filp = NULL;
 
-    /* 如果 fget 可用且偏移量有效，尝试获取 PID */
     if (fget_ptr && owner_pid_offset > 0) {
         filp = fget_ptr(fd);
         if (filp) {
@@ -135,7 +113,6 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
         }
     }
 
-    /* PID 过滤 */
     if (target_pid > 0 && owner_pid != -1 && owner_pid != target_pid) {
         if (filp) fput(filp);
         return;
@@ -259,10 +236,16 @@ static long init(const char *args, const char *event, void *__user reserved)
 {
     hook_err_t err;
 
-    /* 检测 f_owner.pid 偏移量 */
-    detect_fowner_offset();
+    /* 获取 fget 函数指针 */
+    fget_ptr = (typeof(fget_ptr))kallsyms_lookup_name("fget");
+    if (fget_ptr) {
+        printk(KERN_INFO "KMS: fget found, using default f_owner offset: 0x%x\n", owner_pid_offset);
+    } else {
+        printk(KERN_INFO "KMS: fget not found, file PID filter disabled\n");
+        owner_pid_offset = -1; // 禁用文件调用过滤
+    }
 
-    /* 安装四个系统调用钩子 */
+    /* 安装钩子 */
     err = fp_hook_syscalln(__NR_pread64, 4, before_pread64, 0, 0);
     if (err) printk(KERN_ERR "KMS: hook pread64 failed %d\n", err);
 
@@ -275,7 +258,7 @@ static long init(const char *args, const char *event, void *__user reserved)
     err = fp_hook_syscalln(__NR_process_vm_writev, 6, before_process_vm_writev, 0, 0);
     if (err) printk(KERN_ERR "KMS: hook process_vm_writev failed %d\n", err);
 
-    printk(KERN_INFO "KMS: loaded (f_owner offset=%d)\n", owner_pid_offset);
+    printk(KERN_INFO "KMS: loaded (offset=0x%x)\n", owner_pid_offset);
     return 0;
 }
 

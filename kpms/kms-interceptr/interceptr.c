@@ -38,43 +38,47 @@ static int target_pid = 0;   // 0 表示不过滤
 /* ---- CTL0 实现：接收参数，设置 target_pid ---- */
 static long interceptor_control0(const char *args, char *__user out_msg, int outlen)
 {
+    // 查询状态
     if (!args) {
-        // 返回当前状态
         if (out_msg && outlen > 0) {
             if (target_pid == 0)
                 strncpy(out_msg, "filter off", outlen);
             else
-                scnprintf(out_msg, outlen, "filter pid=%d", target_pid);
+                strncpy(out_msg, "filter on", outlen);  // 只返回 on，具体 PID 通过日志查看
         }
         return 0;
     }
 
+    // 关闭过滤
     if (strcmp(args, "off") == 0) {
         target_pid = 0;
         printk(KERN_INFO "KMS: PID filter disabled\n");
         if (out_msg && outlen > 0)
-            strncpy(out_msg, "ok, filter off", outlen);
-    } else {
-        // 尝试解析为整数
-        int pid = 0;
-        const char *p = args;
-        if (*p == '-') p++; // 简单的符号跳过
-        while (*p >= '0' && *p <= '9') {
-            pid = pid * 10 + (*p - '0');
-            p++;
-        }
-        if (*p != '\0') {
-            // 不是纯数字
-            if (out_msg && outlen > 0)
-                strncpy(out_msg, "error: invalid pid", outlen);
-            return -EINVAL;
-        }
-        target_pid = pid;
-        printk(KERN_INFO "KMS: PID filter set to %d\n", target_pid);
-        if (out_msg && outlen > 0)
-            scnprintf(out_msg, outlen, "ok, pid=%d", target_pid);
+            strncpy(out_msg, "ok", outlen);
+        return 0;
     }
 
+    // 设置 PID
+    int pid = 0;
+    const char *p = args;
+    if (*p == '-') {  // 不支持负数 PID，直接报错
+        if (out_msg && outlen > 0)
+            strncpy(out_msg, "err", outlen);
+        return -EINVAL;
+    }
+    while (*p >= '0' && *p <= '9') {
+        pid = pid * 10 + (*p - '0');
+        p++;
+    }
+    if (*p != '\0') {
+        if (out_msg && outlen > 0)
+            strncpy(out_msg, "err", outlen);
+        return -EINVAL;
+    }
+    target_pid = pid;
+    printk(KERN_INFO "KMS: PID filter set to %d\n", target_pid);
+    if (out_msg && outlen > 0)
+        strncpy(out_msg, "ok", outlen);
     return 0;
 }
 

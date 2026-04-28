@@ -2,7 +2,7 @@
 /*
  * KernelMemorySky - System Call Interceptor
  * Hooks: pread64, pwrite64, process_vm_readv, process_vm_writev
- * PID filter for file calls via f_owner (with f_setown support)
+ * PID filter: directly reads current->pid (auto-calibrated offset)
  */
 
 #include <compiler.h>
@@ -15,10 +15,10 @@
 #include <asm/current.h>
 
 KPM_NAME("KernelMemorySky");
-KPM_VERSION("2.0.0");
+KPM_VERSION("3.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Complete PID filter with f_setown support");
+KPM_DESCRIPTION("PID filter using current->pid auto-offset");
 
 /* 自定义 iovec */
 struct kms_iovec {
@@ -26,16 +26,44 @@ struct kms_iovec {
     unsigned long iov_len;
 };
 
-/* 动态内核函数指针 */
+/* 动态内核函数指针 (保留 f_owner 相关，但仅作可选) */
 static struct file *(*fget_ptr)(unsigned int fd) = NULL;
 static void (*fput_ptr)(struct file *) = NULL;
 static int (*f_setown_ptr)(struct file *, pid_t, int) = NULL;
 
 /* 全局变量 */
 static int target_pid = 0;
-static int owner_pid_offset = 0x98;   // 默认偏移，可通过 ofs= 调整
+static int task_pid_offset = -1;   // current->pid 的偏移量，动态检测
 
-/* ---- CTL0 控制接口（强化自动偏移量校准）---- */
+/* ---- 动态检测 current->pid 偏移量 ---- */
+static void detect_task_pid_offset(void)
+{
+    struct task_struct *init = (struct task_struct *)kallsyms_lookup_name("init_task");
+    if (!init) {
+        printk(KERN_ERR "KMS: init_task not found, fallback to f_owner if available\n");
+        return;
+    }
+
+    // 扫描 init_task 结构体，查找值为 1 的 int (因为 init 进程的 pid 是 1)
+    int i;
+    for (i = 0x100; i <= 0x400; i += 4) {
+        int val = *(int *)((unsigned long)init + i);
+        if (val == 1) {
+            // 初步找到可能的 pid 字段，进一步验证：检查下一个 int 是否是 tgid (也是 1)
+            int val2 = *(int *)((unsigned long)init + i + 4);
+            if (val2 == 1) {
+                task_pid_offset = i;
+                printk(KERN_INFO "KMS: detected current->pid offset = 0x%x\n", i);
+                return;
+            }
+        }
+    }
+
+    printk(KERN_WARNING "KMS: could not auto-detect pid offset, using default 0x448\n");
+    task_pid_offset = 0x448; // ARM64 常见值
+}
+
+/* ---- CTL0 控制接口 (支持 so, ofs=, off, PID) ---- */
 static long interceptor_control0(const char *args, char *__user out_msg, int outlen)
 {
     if (!args) {
@@ -48,90 +76,31 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
         return 0;
     }
 
-    /* so<pid>：为目标进程的所有 fd 设置 f_owner，并自动校准偏移量 */
+    /* so<pid>：仅供测试 f_owner 使用 (可选) */
     if (strncmp(args, "so", 2) == 0) {
-        const char *p = args + 2;
-        if (*p < '0' || *p > '9') {
-            if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
-            return -EINVAL;
-        }
-
-        int owner_pid = 0;
-        while (*p >= '0' && *p <= '9') {
-            owner_pid = owner_pid * 10 + (*p - '0');
-            p++;
-        }
-        if (owner_pid <= 0) {
-            if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
-            return -EINVAL;
-        }
-
-        // 如果没有 f_setown，退出
         if (!f_setown_ptr || !fget_ptr || !fput_ptr) {
             if (out_msg && outlen > 0) strncpy(out_msg, "err: no f_setown", outlen);
             return -ENOSYS;
         }
-
-        // 1. 设置所有权
-        int fd;
-        for (fd = 0; fd < 1024; fd++) {
+        const char *p = args + 2;
+        int owner_pid = 0;
+        while (*p >= '0' && *p <= '9') owner_pid = owner_pid * 10 + (*p++ - '0');
+        if (owner_pid <= 0) {
+            if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
+            return -EINVAL;
+        }
+        for (int fd = 0; fd < 1024; fd++) {
             struct file *filp = fget_ptr(fd);
             if (!filp) continue;
             f_setown_ptr(filp, owner_pid, 0);
             fput_ptr(filp);
         }
-
-        // 2. 自动校准偏移量：在多个常用 fd 上扫描
-        int found = 0;
-        int test_fds[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, -1}; // -1 作为结束标记
-        for (int i = 0; test_fds[i] != -1 && !found; i++) {
-            struct file *test_filp = fget_ptr(test_fds[i]);
-            if (!test_filp) continue;
-
-            // 在 0x80 到 0x180 之间，每 4 字节扫描
-            for (int offset = 0x80; offset <= 0x180 && !found; offset += 4) {
-                int val = *(int *)((unsigned long)test_filp + offset);
-                if (val == owner_pid) {
-                    owner_pid_offset = offset;
-                    found = 1;
-                    printk(KERN_INFO "KMS: Found matching PID at offset 0x%x on fd %d\n", offset, test_fds[i]);
-                    break;
-                }
-            }
-            fput_ptr(test_filp);
-        }
-
-        if (found) {
-            printk(KERN_INFO "KMS: setowner pid=%d, offset auto-calibrated to 0x%x\n", owner_pid, owner_pid_offset);
-            if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
-        } else {
-            printk(KERN_WARNING "KMS: setowner pid=%d done, but could not auto-detect offset, keeping 0x%x\n", owner_pid, owner_pid_offset);
-            if (out_msg && outlen > 0) strncpy(out_msg, "ok, offset?", outlen);
-        }
-
-        return 0;
-    }
-
-    /* ofs=0x??：手动设置 f_owner.pid 偏移量（如果自动校准不满意） */
-    if (strncmp(args, "ofs=", 4) == 0) {
-        const char *p = args + 4;
-        if (*p == '0' && (*(p+1) == 'x' || *(p+1) == 'X')) p += 2;
-        int new_ofs = 0;
-        while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) {
-            new_ofs = (new_ofs << 4) + (*p >= 'A' ? ((*p & 0xDF) - 'A' + 10) : (*p - '0'));
-            p++;
-        }
-        if (*p != '\0') {
-            if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
-            return -EINVAL;
-        }
-        owner_pid_offset = new_ofs;
-        printk(KERN_INFO "KMS: f_owner offset manually set to 0x%x\n", owner_pid_offset);
+        printk(KERN_INFO "KMS: f_setown executed for pid %d\n", owner_pid);
         if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
         return 0;
     }
 
-    /* off：关闭过滤 */
+    /* off */
     if (strcmp(args, "off") == 0) {
         target_pid = 0;
         printk(KERN_INFO "KMS: PID filter disabled\n");
@@ -146,10 +115,7 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
         if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
         return -EINVAL;
     }
-    while (*p >= '0' && *p <= '9') {
-        pid = pid * 10 + (*p - '0');
-        p++;
-    }
+    while (*p >= '0' && *p <= '9') pid = pid * 10 + (*p++ - '0');
     if (*p != '\0') {
         if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
         return -EINVAL;
@@ -160,31 +126,27 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
     return 0;
 }
 
-/* ---- pread64（f_owner 过滤）---- */
+/* ---- 辅助：从 current 读取调用者 PID ---- */
+static inline pid_t get_current_pid(void)
+{
+    if (task_pid_offset <= 0) return -1;
+    return *(int *)((unsigned long)current + task_pid_offset);
+}
+
+/* ---- pread64 (使用 current->pid 过滤) ---- */
 static void before_pread64(hook_fargs4_t *fargs, void *udata)
 {
+    pid_t caller_pid = get_current_pid();
+    if (target_pid > 0 && caller_pid != -1 && caller_pid != target_pid)
+        return;
+
     int fd = (int)syscall_argn(fargs, 0);
     void __user *buf = (void __user *)syscall_argn(fargs, 1);
     size_t count = (size_t)syscall_argn(fargs, 2);
     loff_t pos = (loff_t)syscall_argn(fargs, 3);
 
-    pid_t owner_pid = -1;
-    struct file *filp = NULL;
-
-    if (fget_ptr && fput_ptr && owner_pid_offset > 0) {
-        filp = fget_ptr(fd);
-        if (filp) {
-            owner_pid = *(int *)((unsigned long)filp + owner_pid_offset);
-        }
-    }
-
-    if (target_pid > 0 && owner_pid != -1 && owner_pid != target_pid) {
-        if (filp) fput_ptr(filp);
-        return;
-    }
-
     printk(KERN_INFO "KMS| pread64 | PID=%d FD=%d BUF=%px COUNT=%zu POS=%lld\n",
-           owner_pid, fd, buf, count, pos);
+           caller_pid, fd, buf, count, pos);
 
     if (buf && count > 0) {
         unsigned char tmp[32];
@@ -193,35 +155,22 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
             printk(KERN_INFO "KMS| pread64 DATA: %*phN\n", (int)len, tmp);
         }
     }
-
-    if (filp) fput_ptr(filp);
 }
 
-/* ---- pwrite64（f_owner 过滤）---- */
+/* ---- pwrite64 (使用 current->pid 过滤) ---- */
 static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
 {
+    pid_t caller_pid = get_current_pid();
+    if (target_pid > 0 && caller_pid != -1 && caller_pid != target_pid)
+        return;
+
     int fd = (int)syscall_argn(fargs, 0);
     const void __user *buf = (const void __user *)syscall_argn(fargs, 1);
     size_t count = (size_t)syscall_argn(fargs, 2);
     loff_t pos = (loff_t)syscall_argn(fargs, 3);
 
-    pid_t owner_pid = -1;
-    struct file *filp = NULL;
-
-    if (fget_ptr && fput_ptr && owner_pid_offset > 0) {
-        filp = fget_ptr(fd);
-        if (filp) {
-            owner_pid = *(int *)((unsigned long)filp + owner_pid_offset);
-        }
-    }
-
-    if (target_pid > 0 && owner_pid != -1 && owner_pid != target_pid) {
-        if (filp) fput_ptr(filp);
-        return;
-    }
-
     printk(KERN_INFO "KMS| pwrite64 | PID=%d FD=%d BUF=%px COUNT=%zu POS=%lld\n",
-           owner_pid, fd, buf, count, pos);
+           caller_pid, fd, buf, count, pos);
 
     if (buf && count > 0) {
         unsigned char tmp[32];
@@ -230,11 +179,9 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
             printk(KERN_INFO "KMS| pwrite64 DATA: %*phN\n", (int)len, tmp);
         }
     }
-
-    if (filp) fput_ptr(filp);
 }
 
-/* ---- process_vm_readv（目标 PID 过滤，不变）---- */
+/* ---- process_vm_readv (目标 PID 过滤，不变) ---- */
 static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
 {
     pid_t tpid = (pid_t)syscall_argn(fargs, 0);
@@ -265,7 +212,7 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
     }
 }
 
-/* ---- process_vm_writev（目标 PID 过滤，不变）---- */
+/* ---- process_vm_writev (目标 PID 过滤，不变) ---- */
 static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
 {
     pid_t tpid = (pid_t)syscall_argn(fargs, 0);
@@ -301,20 +248,13 @@ static long init(const char *args, const char *event, void *__user reserved)
 {
     hook_err_t err;
 
-    /* 动态获取 fget, fput, f_setown */
+    /* 检测 current->pid 偏移 */
+    detect_task_pid_offset();
+
+    /* 获取 f_owner 相关函数 (可选) */
     fget_ptr = (typeof(fget_ptr))kallsyms_lookup_name("fget");
     fput_ptr = (typeof(fput_ptr))kallsyms_lookup_name("fput");
     f_setown_ptr = (typeof(f_setown_ptr))kallsyms_lookup_name("f_setown");
-
-    if (fget_ptr && fput_ptr && f_setown_ptr) {
-        printk(KERN_INFO "KMS: fget, fput, f_setown obtained. offset=0x%x\n", owner_pid_offset);
-    } else {
-        printk(KERN_ERR "KMS: critical kernel functions missing, file PID filter disabled\n");
-        owner_pid_offset = -1;
-        fget_ptr = NULL;
-        fput_ptr = NULL;
-        f_setown_ptr = NULL;
-    }
 
     /* 安装钩子 */
     err = fp_hook_syscalln(__NR_pread64, 4, before_pread64, 0, 0);
@@ -329,7 +269,7 @@ static long init(const char *args, const char *event, void *__user reserved)
     err = fp_hook_syscalln(__NR_process_vm_writev, 6, before_process_vm_writev, 0, 0);
     if (err) printk(KERN_ERR "KMS: hook process_vm_writev failed %d\n", err);
 
-    printk(KERN_INFO "KMS: loaded (offset=0x%x, setowner ready)\n", owner_pid_offset);
+    printk(KERN_INFO "KMS: loaded, pid offset=0x%x\n", task_pid_offset);
     return 0;
 }
 

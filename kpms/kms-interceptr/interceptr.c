@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * KernelMemorySky - 集成版拦截器
+ * KernelMemorySky - 集成版拦截器（修正头文件）
  * 功能:
  * - Hook pread64, pwrite64, process_vm_readv, process_vm_writev
  * - PID 过滤（process_vm 按目标 PID，pread64/pwrite64 全量输出）
@@ -16,9 +16,10 @@
 #include <linux/string.h>
 #include <kputils.h>
 #include <asm/current.h>
+#include <stdarg.h>   // <-- 添加这个头文件
 
 KPM_NAME("KernelMemorySky");
-KPM_VERSION("3.0.0");
+KPM_VERSION("3.0.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
 KPM_DESCRIPTION("Integrated interceptor with ring buffer + CTL0");

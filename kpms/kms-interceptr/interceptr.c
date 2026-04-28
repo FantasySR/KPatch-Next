@@ -2,8 +2,7 @@
 /*
  * KernelMemorySky - System Call Interceptor
  * Hooks: pread64, pwrite64, process_vm_readv, process_vm_writev
- * PID filter for file calls via f_owner (adjustable offset)
- * All kernel functions obtained via kallsyms to avoid missing symbols.
+ * PID filter for file calls via f_owner (with f_setown support)
  */
 
 #include <compiler.h>
@@ -16,10 +15,10 @@
 #include <asm/current.h>
 
 KPM_NAME("KernelMemorySky");
-KPM_VERSION("1.4.1");
+KPM_VERSION("2.0.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("PID filter with adjustable f_owner offset (dynamic symbols)");
+KPM_DESCRIPTION("Complete PID filter with f_setown support");
 
 /* 自定义 iovec */
 struct kms_iovec {
@@ -27,15 +26,16 @@ struct kms_iovec {
     unsigned long iov_len;
 };
 
-/* 动态获取的内核函数指针 */
+/* 动态内核函数指针 */
 static struct file *(*fget_ptr)(unsigned int fd) = NULL;
 static void (*fput_ptr)(struct file *) = NULL;
+static int (*f_setown_ptr)(struct file *, pid_t, int) = NULL;
 
 /* 全局变量 */
 static int target_pid = 0;
-static int owner_pid_offset = 0x98;   // ARM64 常见默认值，可通过 ofs= 调整
+static int owner_pid_offset = 0x98;   // 默认偏移，可通过 ofs= 调整
 
-/* ---- CTL0 控制接口（支持 offset 设置）---- */
+/* ---- CTL0 控制接口（支持 setowner, ofs, PID, off）---- */
 static long interceptor_control0(const char *args, char *__user out_msg, int outlen)
 {
     if (!args) {
@@ -48,7 +48,43 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
         return 0;
     }
 
-    /* 设置偏移量: ofs=0xA0 */
+    /* setowner <pid>：为目标进程的所有 fd 设置 f_owner */
+    if (strncmp(args, "setowner ", 9) == 0) {
+        if (!f_setown_ptr || !fget_ptr || !fput_ptr) {
+            if (out_msg && outlen > 0) strncpy(out_msg, "err: no f_setown", outlen);
+            return -ENOSYS;
+        }
+
+        int owner_pid = 0;
+        const char *p = args + 9;
+        if (*p == '-') {
+            if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
+            return -EINVAL;
+        }
+        while (*p >= '0' && *p <= '9') {
+            owner_pid = owner_pid * 10 + (*p - '0');
+            p++;
+        }
+        if (*p != '\0' || owner_pid <= 0) {
+            if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
+            return -EINVAL;
+        }
+
+        // 遍历目标进程的 fd 表（简单粗暴：循环所有可能的 fd 直到 fget 返回 NULL）
+        int fd;
+        for (fd = 0; fd < 1024; fd++) {
+            struct file *filp = fget_ptr(fd);
+            if (!filp) continue; // fd 不存在
+            f_setown_ptr(filp, owner_pid, 0); // 设置 f_owner.pid
+            fput_ptr(filp);
+        }
+
+        printk(KERN_INFO "KMS: setowner executed for pid %d\n", owner_pid);
+        if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
+        return 0;
+    }
+
+    /* ofs=0x??：设置 f_owner.pid 偏移量 */
     if (strncmp(args, "ofs=", 4) == 0) {
         const char *p = args + 4;
         if (*p == '0' && (*(p+1) == 'x' || *(p+1) == 'X')) p += 2;
@@ -67,7 +103,7 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
         return 0;
     }
 
-    /* 关闭过滤 */
+    /* off：关闭过滤 */
     if (strcmp(args, "off") == 0) {
         target_pid = 0;
         printk(KERN_INFO "KMS: PID filter disabled\n");
@@ -75,7 +111,7 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
         return 0;
     }
 
-    /* 设置 PID */
+    /* 数字：设置过滤 PID */
     int pid = 0;
     const char *p = args;
     if (*p == '-') {
@@ -96,7 +132,7 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
     return 0;
 }
 
-/* ---- pread64（使用 f_owner 过滤）---- */
+/* ---- pread64（f_owner 过滤）---- */
 static void before_pread64(hook_fargs4_t *fargs, void *udata)
 {
     int fd = (int)syscall_argn(fargs, 0);
@@ -133,7 +169,7 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
     if (filp) fput_ptr(filp);
 }
 
-/* ---- pwrite64（使用 f_owner 过滤）---- */
+/* ---- pwrite64（f_owner 过滤）---- */
 static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
 {
     int fd = (int)syscall_argn(fargs, 0);
@@ -170,7 +206,7 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
     if (filp) fput_ptr(filp);
 }
 
-/* ---- process_vm_readv（不变）---- */
+/* ---- process_vm_readv（目标 PID 过滤，不变）---- */
 static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
 {
     pid_t tpid = (pid_t)syscall_argn(fargs, 0);
@@ -201,7 +237,7 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
     }
 }
 
-/* ---- process_vm_writev（不变）---- */
+/* ---- process_vm_writev（目标 PID 过滤，不变）---- */
 static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
 {
     pid_t tpid = (pid_t)syscall_argn(fargs, 0);
@@ -237,17 +273,19 @@ static long init(const char *args, const char *event, void *__user reserved)
 {
     hook_err_t err;
 
-    /* 动态获取 fget 和 fput */
+    /* 动态获取 fget, fput, f_setown */
     fget_ptr = (typeof(fget_ptr))kallsyms_lookup_name("fget");
     fput_ptr = (typeof(fput_ptr))kallsyms_lookup_name("fput");
+    f_setown_ptr = (typeof(f_setown_ptr))kallsyms_lookup_name("f_setown");
 
-    if (fget_ptr && fput_ptr) {
-        printk(KERN_INFO "KMS: fget and fput obtained, using default f_owner offset: 0x%x\n", owner_pid_offset);
+    if (fget_ptr && fput_ptr && f_setown_ptr) {
+        printk(KERN_INFO "KMS: fget, fput, f_setown obtained. offset=0x%x\n", owner_pid_offset);
     } else {
-        printk(KERN_ERR "KMS: fget or fput not found, file PID filter disabled\n");
-        owner_pid_offset = -1; // 禁用文件调用过滤
+        printk(KERN_ERR "KMS: critical kernel functions missing, file PID filter disabled\n");
+        owner_pid_offset = -1;
         fget_ptr = NULL;
         fput_ptr = NULL;
+        f_setown_ptr = NULL;
     }
 
     /* 安装钩子 */
@@ -263,7 +301,7 @@ static long init(const char *args, const char *event, void *__user reserved)
     err = fp_hook_syscalln(__NR_process_vm_writev, 6, before_process_vm_writev, 0, 0);
     if (err) printk(KERN_ERR "KMS: hook process_vm_writev failed %d\n", err);
 
-    printk(KERN_INFO "KMS: loaded (offset=0x%x)\n", owner_pid_offset);
+    printk(KERN_INFO "KMS: loaded (offset=0x%x, setowner ready)\n", owner_pid_offset);
     return 0;
 }
 

@@ -44,7 +44,7 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
             if (target_pid == 0)
                 strncpy(out_msg, "filter off", outlen);
             else
-                snprintf(out_msg, outlen, "filter pid=%d", target_pid);
+                scnprintf(out_msg, outlen, "filter pid=%d", target_pid);
         }
         return 0;
     }
@@ -57,9 +57,8 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
     } else {
         // 尝试解析为整数
         int pid = 0;
-        int sign = 1;
         const char *p = args;
-        if (*p == '-') { sign = -1; p++; }
+        if (*p == '-') p++; // 简单的符号跳过
         while (*p >= '0' && *p <= '9') {
             pid = pid * 10 + (*p - '0');
             p++;
@@ -70,10 +69,10 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
                 strncpy(out_msg, "error: invalid pid", outlen);
             return -EINVAL;
         }
-        target_pid = sign * pid;
+        target_pid = pid;
         printk(KERN_INFO "KMS: PID filter set to %d\n", target_pid);
         if (out_msg && outlen > 0)
-            snprintf(out_msg, outlen, "ok, pid=%d", target_pid);
+            scnprintf(out_msg, outlen, "ok, pid=%d", target_pid);
     }
 
     return 0;

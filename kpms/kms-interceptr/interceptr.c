@@ -2,7 +2,8 @@
 /*
  * KernelMemorySky - System Call Interceptor
  * Hooks: pread64, pwrite64, process_vm_readv, process_vm_writev
- * PID filter for file calls via f_owner (default offset 0x98)
+ * PID filter for file calls via f_owner (adjustable offset)
+ * All kernel functions obtained via kallsyms to avoid missing symbols.
  */
 
 #include <compiler.h>
@@ -15,10 +16,10 @@
 #include <asm/current.h>
 
 KPM_NAME("KernelMemorySky");
-KPM_VERSION("1.4.0");
+KPM_VERSION("1.4.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("PID filter with adjustable f_owner offset");
+KPM_DESCRIPTION("PID filter with adjustable f_owner offset (dynamic symbols)");
 
 /* 自定义 iovec */
 struct kms_iovec {
@@ -26,13 +27,13 @@ struct kms_iovec {
     unsigned long iov_len;
 };
 
-/* 缺失的外部函数声明 */
-extern void fput(struct file *);
+/* 动态获取的内核函数指针 */
 static struct file *(*fget_ptr)(unsigned int fd) = NULL;
+static void (*fput_ptr)(struct file *) = NULL;
 
 /* 全局变量 */
 static int target_pid = 0;
-static int owner_pid_offset = 0x98;   // ARM64 常见 f_owner.pid 偏移，可调
+static int owner_pid_offset = 0x98;   // ARM64 常见默认值，可通过 ofs= 调整
 
 /* ---- CTL0 控制接口（支持 offset 设置）---- */
 static long interceptor_control0(const char *args, char *__user out_msg, int outlen)
@@ -47,7 +48,7 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
         return 0;
     }
 
-    /* 设置偏移量命令: ofs=0xA0 */
+    /* 设置偏移量: ofs=0xA0 */
     if (strncmp(args, "ofs=", 4) == 0) {
         const char *p = args + 4;
         if (*p == '0' && (*(p+1) == 'x' || *(p+1) == 'X')) p += 2;
@@ -106,7 +107,7 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
     pid_t owner_pid = -1;
     struct file *filp = NULL;
 
-    if (fget_ptr && owner_pid_offset > 0) {
+    if (fget_ptr && fput_ptr && owner_pid_offset > 0) {
         filp = fget_ptr(fd);
         if (filp) {
             owner_pid = *(int *)((unsigned long)filp + owner_pid_offset);
@@ -114,7 +115,7 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
     }
 
     if (target_pid > 0 && owner_pid != -1 && owner_pid != target_pid) {
-        if (filp) fput(filp);
+        if (filp) fput_ptr(filp);
         return;
     }
 
@@ -129,7 +130,7 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
         }
     }
 
-    if (filp) fput(filp);
+    if (filp) fput_ptr(filp);
 }
 
 /* ---- pwrite64（使用 f_owner 过滤）---- */
@@ -143,7 +144,7 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
     pid_t owner_pid = -1;
     struct file *filp = NULL;
 
-    if (fget_ptr && owner_pid_offset > 0) {
+    if (fget_ptr && fput_ptr && owner_pid_offset > 0) {
         filp = fget_ptr(fd);
         if (filp) {
             owner_pid = *(int *)((unsigned long)filp + owner_pid_offset);
@@ -151,7 +152,7 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
     }
 
     if (target_pid > 0 && owner_pid != -1 && owner_pid != target_pid) {
-        if (filp) fput(filp);
+        if (filp) fput_ptr(filp);
         return;
     }
 
@@ -166,7 +167,7 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
         }
     }
 
-    if (filp) fput(filp);
+    if (filp) fput_ptr(filp);
 }
 
 /* ---- process_vm_readv（不变）---- */
@@ -236,13 +237,17 @@ static long init(const char *args, const char *event, void *__user reserved)
 {
     hook_err_t err;
 
-    /* 获取 fget 函数指针 */
+    /* 动态获取 fget 和 fput */
     fget_ptr = (typeof(fget_ptr))kallsyms_lookup_name("fget");
-    if (fget_ptr) {
-        printk(KERN_INFO "KMS: fget found, using default f_owner offset: 0x%x\n", owner_pid_offset);
+    fput_ptr = (typeof(fput_ptr))kallsyms_lookup_name("fput");
+
+    if (fget_ptr && fput_ptr) {
+        printk(KERN_INFO "KMS: fget and fput obtained, using default f_owner offset: 0x%x\n", owner_pid_offset);
     } else {
-        printk(KERN_INFO "KMS: fget not found, file PID filter disabled\n");
+        printk(KERN_ERR "KMS: fget or fput not found, file PID filter disabled\n");
         owner_pid_offset = -1; // 禁用文件调用过滤
+        fget_ptr = NULL;
+        fput_ptr = NULL;
     }
 
     /* 安装钩子 */

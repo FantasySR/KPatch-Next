@@ -12,10 +12,24 @@
 #include <linux/fs.h>
 
 KPM_NAME("DeviceTest");
-KPM_VERSION("1.1.0");
+KPM_VERSION("1.1.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
 KPM_DESCRIPTION("Test misc device with read/write");
+
+/* ---- 手动补充缺失的宏和声明 ---- */
+#ifndef EFAULT
+#define EFAULT 14
+#endif
+#ifndef ENOMEM
+#define ENOMEM 12
+#endif
+#ifndef GFP_KERNEL
+#define GFP_KERNEL 0xcc0U
+#endif
+
+extern unsigned long copy_to_user(void __user *to, const void *from, unsigned long n);
+extern unsigned long copy_from_user(void *to, const void __user *from, unsigned long n);
 
 /* ---- 手动定义必要结构体 ---- */
 struct miscdevice {
@@ -43,9 +57,9 @@ struct file_operations {
 /* ---- 环形缓冲区 ---- */
 #define BUF_SIZE (1024 * 1024)  // 1MB
 static char *ring_buf = NULL;
-static size_t ring_head = 0;  // 写位置
-static size_t ring_tail = 0;  // 读位置
-static size_t ring_count = 0; // 当前字节数
+static size_t ring_head = 0;
+static size_t ring_tail = 0;
+static size_t ring_count = 0;
 
 /* ---- 内核函数动态引用 ---- */
 typedef int (*misc_register_t)(struct miscdevice *);
@@ -66,16 +80,14 @@ static int dev_release(struct inode *inode, struct file *file) {
 
 static ssize_t dev_read(struct file *file, char __user *buf, size_t len, loff_t *off) {
     size_t available = ring_count;
-    if (available == 0) return 0; // 无数据
+    if (available == 0) return 0;
 
     size_t to_copy = (len < available) ? len : available;
     size_t first_chunk = (ring_tail + to_copy <= BUF_SIZE) ? to_copy : (BUF_SIZE - ring_tail);
 
-    // 拷贝第一部分
     if (copy_to_user(buf, ring_buf + ring_tail, first_chunk)) {
         return -EFAULT;
     }
-    // 如果有回绕，拷贝第二部分
     if (to_copy > first_chunk) {
         if (copy_to_user(buf + first_chunk, ring_buf, to_copy - first_chunk)) {
             return -EFAULT;
@@ -88,21 +100,19 @@ static ssize_t dev_read(struct file *file, char __user *buf, size_t len, loff_t 
 }
 
 static ssize_t dev_write(struct file *file, const char __user *buf, size_t len, loff_t *off) {
-    // 仅用于接收控制命令
     char kb[128];
     size_t l = len < sizeof(kb)-1 ? len : sizeof(kb)-1;
     if (copy_from_user(kb, buf, l)) return -EFAULT;
     kb[l] = '\0';
 
     printk(KERN_INFO "DeviceTest: received command: %s\n", kb);
-    // 简单回显：把命令写入环形缓冲区（实际项目中应为被拦截的日志）
+    // 把命令写入环形缓冲区作为回显
     size_t cmd_len = strlen(kb);
     for (size_t i = 0; i < cmd_len; i++) {
         ring_buf[ring_head] = kb[i];
         ring_head = (ring_head + 1) % BUF_SIZE;
         if (ring_count < BUF_SIZE) ring_count++;
     }
-    // 在尾部添加换行
     ring_buf[ring_head] = '\n';
     ring_head = (ring_head + 1) % BUF_SIZE;
     if (ring_count < BUF_SIZE) ring_count++;
@@ -151,7 +161,7 @@ static long init(const char *args, const char *event, void *__user reserved)
     return 0;
 }
 
-static long exit(void *__user reserved)
+static long dev_exit(void *__user reserved)
 {
     if (misc_deregister_ptr) misc_deregister_ptr(&dev_misc);
     if (ring_buf) kfree(ring_buf);
@@ -160,4 +170,4 @@ static long exit(void *__user reserved)
 }
 
 KPM_INIT(init);
-KPM_EXIT(exit);
+KPM_EXIT(dev_exit);

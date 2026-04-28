@@ -35,7 +35,7 @@ static int (*f_setown_ptr)(struct file *, pid_t, int) = NULL;
 static int target_pid = 0;
 static int owner_pid_offset = 0x98;   // 默认偏移，可通过 ofs= 调整
 
-/* ---- CTL0 控制接口（自动偏移量校准）---- */
+/* ---- CTL0 控制接口（强化自动偏移量校准）---- */
 static long interceptor_control0(const char *args, char *__user out_msg, int outlen)
 {
     if (!args) {
@@ -72,7 +72,7 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
             return -ENOSYS;
         }
 
-        // 设置所有权
+        // 1. 设置所有权
         int fd;
         for (fd = 0; fd < 1024; fd++) {
             struct file *filp = fget_ptr(fd);
@@ -81,37 +81,32 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
             fput_ptr(filp);
         }
 
-        // 自动校准偏移量：用 fd 0 验证
-        struct file *test_filp = fget_ptr(0);
-        if (test_filp) {
-            int found = 0;
-            // 如果当前偏移量有效，直接使用
-            if (*(int *)((unsigned long)test_filp + owner_pid_offset) == owner_pid) {
-                found = 1;
-            } else {
-                // 否则扫描附近内存，寻找 PID
-                int i;
-                for (i = 0x80; i <= 0xC0; i += 4) {
-                    int val = *(int *)((unsigned long)test_filp + i);
-                    if (val == owner_pid) {
-                        owner_pid_offset = i;
-                        found = 1;
-                        break;
-                    }
+        // 2. 自动校准偏移量：在多个常用 fd 上扫描
+        int found = 0;
+        int test_fds[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, -1}; // -1 作为结束标记
+        for (int i = 0; test_fds[i] != -1 && !found; i++) {
+            struct file *test_filp = fget_ptr(test_fds[i]);
+            if (!test_filp) continue;
+
+            // 在 0x80 到 0x180 之间，每 4 字节扫描
+            for (int offset = 0x80; offset <= 0x180 && !found; offset += 4) {
+                int val = *(int *)((unsigned long)test_filp + offset);
+                if (val == owner_pid) {
+                    owner_pid_offset = offset;
+                    found = 1;
+                    printk(KERN_INFO "KMS: Found matching PID at offset 0x%x on fd %d\n", offset, test_fds[i]);
+                    break;
                 }
             }
             fput_ptr(test_filp);
+        }
 
-            if (found) {
-                printk(KERN_INFO "KMS: setowner pid=%d, offset auto-calibrated to 0x%x\n", owner_pid, owner_pid_offset);
-                if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
-            } else {
-                printk(KERN_WARNING "KMS: setowner pid=%d done, but could not auto-detect offset, keeping 0x%x\n", owner_pid, owner_pid_offset);
-                if (out_msg && outlen > 0) strncpy(out_msg, "ok, offset?", outlen);
-            }
-        } else {
-            printk(KERN_WARNING "KMS: setowner pid=%d done, but fd 0 not available for offset check\n", owner_pid);
+        if (found) {
+            printk(KERN_INFO "KMS: setowner pid=%d, offset auto-calibrated to 0x%x\n", owner_pid, owner_pid_offset);
             if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
+        } else {
+            printk(KERN_WARNING "KMS: setowner pid=%d done, but could not auto-detect offset, keeping 0x%x\n", owner_pid, owner_pid_offset);
+            if (out_msg && outlen > 0) strncpy(out_msg, "ok, offset?", outlen);
         }
 
         return 0;

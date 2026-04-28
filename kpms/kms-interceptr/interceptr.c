@@ -2,7 +2,7 @@
 /*
  * KernelMemorySky - System Call Interceptor
  * Hooks: pread64, pwrite64, process_vm_readv, process_vm_writev
- * Features: PID filter via CTL0
+ * PID filter uses target pid in process_vm_readv/writev (no extra symbols)
  */
 
 #include <compiler.h>
@@ -15,16 +15,10 @@
 #include <asm/current.h>
 
 KPM_NAME("KernelMemorySky");
-KPM_VERSION("1.1.0");
+KPM_VERSION("1.2.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Interceptor with PID filter");
-
-/* 动态查找 __task_pid_nr_ns 用来获取 PID/TGID */
-struct pid_namespace;
-static pid_t (*__task_pid_nr_ns)(struct task_struct *task, int type, struct pid_namespace *ns) = NULL;
-#define KMSPID_PID   0
-#define KMSPID_TGID  1
+KPM_DESCRIPTION("Interceptor with PID filter (target-pid based)");
 
 /* 自定义 iovec 结构体 */
 struct kms_iovec {
@@ -38,18 +32,16 @@ static int target_pid = 0;   // 0 表示不过滤
 /* ---- CTL0 实现：接收参数，设置 target_pid ---- */
 static long interceptor_control0(const char *args, char *__user out_msg, int outlen)
 {
-    // 查询状态
     if (!args) {
         if (out_msg && outlen > 0) {
             if (target_pid == 0)
                 strncpy(out_msg, "filter off", outlen);
             else
-                strncpy(out_msg, "filter on", outlen);  // 只返回 on，具体 PID 通过日志查看
+                strncpy(out_msg, "filter on", outlen);
         }
         return 0;
     }
 
-    // 关闭过滤
     if (strcmp(args, "off") == 0) {
         target_pid = 0;
         printk(KERN_INFO "KMS: PID filter disabled\n");
@@ -58,10 +50,9 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
         return 0;
     }
 
-    // 设置 PID
     int pid = 0;
     const char *p = args;
-    if (*p == '-') {  // 不支持负数 PID，直接报错
+    if (*p == '-') {
         if (out_msg && outlen > 0)
             strncpy(out_msg, "err", outlen);
         return -EINVAL;
@@ -85,21 +76,13 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
 /* ---- pread64 (fd, buf, count, pos) ---- */
 static void before_pread64(hook_fargs4_t *fargs, void *udata)
 {
-    struct task_struct *task = current;
-    pid_t pid = __task_pid_nr_ns ? __task_pid_nr_ns(task, KMSPID_PID, NULL) : -1;
-
-    // PID 过滤
-    if (target_pid > 0 && pid != target_pid)
-        return;
-
     int fd = (int)syscall_argn(fargs, 0);
     void __user *buf = (void __user *)syscall_argn(fargs, 1);
     size_t count = (size_t)syscall_argn(fargs, 2);
     loff_t pos = (loff_t)syscall_argn(fargs, 3);
-    pid_t tgid = __task_pid_nr_ns ? __task_pid_nr_ns(task, KMSPID_TGID, NULL) : -1;
 
-    printk(KERN_INFO "KMS| pread64 | PID=%d TGID=%d FD=%d BUF=%px COUNT=%zu POS=%lld\n",
-           pid, tgid, fd, buf, count, pos);
+    printk(KERN_INFO "KMS| pread64 | FD=%d BUF=%px COUNT=%zu POS=%lld\n",
+           fd, buf, count, pos);
 
     if (buf && count > 0) {
         unsigned char tmp[32];
@@ -113,20 +96,13 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
 /* ---- pwrite64 ---- */
 static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
 {
-    struct task_struct *task = current;
-    pid_t pid = __task_pid_nr_ns ? __task_pid_nr_ns(task, KMSPID_PID, NULL) : -1;
-
-    if (target_pid > 0 && pid != target_pid)
-        return;
-
     int fd = (int)syscall_argn(fargs, 0);
     const void __user *buf = (const void __user *)syscall_argn(fargs, 1);
     size_t count = (size_t)syscall_argn(fargs, 2);
     loff_t pos = (loff_t)syscall_argn(fargs, 3);
-    pid_t tgid = __task_pid_nr_ns ? __task_pid_nr_ns(task, KMSPID_TGID, NULL) : -1;
 
-    printk(KERN_INFO "KMS| pwrite64 | PID=%d TGID=%d FD=%d BUF=%px COUNT=%zu POS=%lld\n",
-           pid, tgid, fd, buf, count, pos);
+    printk(KERN_INFO "KMS| pwrite64 | FD=%d BUF=%px COUNT=%zu POS=%lld\n",
+           fd, buf, count, pos);
 
     if (buf && count > 0) {
         unsigned char tmp[32];
@@ -137,25 +113,21 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
     }
 }
 
-/* ---- process_vm_readv ---- */
+/* ---- process_vm_readv (target_pid, local_iov, liovcnt, remote_iov, riovcnt, flags) ---- */
 static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
 {
-    struct task_struct *task = current;
-    pid_t pid = __task_pid_nr_ns ? __task_pid_nr_ns(task, KMSPID_PID, NULL) : -1;
-
-    if (target_pid > 0 && pid != target_pid)
+    pid_t tpid = (pid_t)syscall_argn(fargs, 0);  // 目标进程 PID
+    if (target_pid > 0 && tpid != target_pid)
         return;
 
-    pid_t target_pid = (pid_t)syscall_argn(fargs, 0);
     void __user *local_iov = (void __user *)syscall_argn(fargs, 1);
     unsigned long liovcnt = (unsigned long)syscall_argn(fargs, 2);
     void __user *remote_iov = (void __user *)syscall_argn(fargs, 3);
     unsigned long riovcnt = (unsigned long)syscall_argn(fargs, 4);
     unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
-    pid_t tgid = __task_pid_nr_ns ? __task_pid_nr_ns(task, KMSPID_TGID, NULL) : -1;
 
-    printk(KERN_INFO "KMS| process_vm_readv | PID=%d TGID=%d TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
-           pid, tgid, target_pid, local_iov, liovcnt, remote_iov, riovcnt, flags);
+    printk(KERN_INFO "KMS| process_vm_readv | TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
+           tpid, local_iov, liovcnt, remote_iov, riovcnt, flags);
 
     if (local_iov && liovcnt > 0) {
         struct kms_iovec __user *local_vec = (struct kms_iovec __user *)local_iov;
@@ -175,22 +147,18 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
 /* ---- process_vm_writev ---- */
 static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
 {
-    struct task_struct *task = current;
-    pid_t pid = __task_pid_nr_ns ? __task_pid_nr_ns(task, KMSPID_PID, NULL) : -1;
-
-    if (target_pid > 0 && pid != target_pid)
+    pid_t tpid = (pid_t)syscall_argn(fargs, 0);
+    if (target_pid > 0 && tpid != target_pid)
         return;
 
-    pid_t target_pid = (pid_t)syscall_argn(fargs, 0);
     void __user *local_iov = (void __user *)syscall_argn(fargs, 1);
     unsigned long liovcnt = (unsigned long)syscall_argn(fargs, 2);
     void __user *remote_iov = (void __user *)syscall_argn(fargs, 3);
     unsigned long riovcnt = (unsigned long)syscall_argn(fargs, 4);
     unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
-    pid_t tgid = __task_pid_nr_ns ? __task_pid_nr_ns(task, KMSPID_TGID, NULL) : -1;
 
-    printk(KERN_INFO "KMS| process_vm_writev | PID=%d TGID=%d TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
-           pid, tgid, target_pid, local_iov, liovcnt, remote_iov, riovcnt, flags);
+    printk(KERN_INFO "KMS| process_vm_writev | TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
+           tpid, local_iov, liovcnt, remote_iov, riovcnt, flags);
 
     if (local_iov && liovcnt > 0) {
         struct kms_iovec __user *local_vec = (struct kms_iovec __user *)local_iov;
@@ -210,9 +178,6 @@ static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
 /* ---- 初始化 ---- */
 static long init(const char *args, const char *event, void *__user reserved)
 {
-    __task_pid_nr_ns = (typeof(__task_pid_nr_ns))kallsyms_lookup_name("__task_pid_nr_ns");
-    pr_info("KMS: __task_pid_nr_ns addr: %px\n", __task_pid_nr_ns);
-
     hook_err_t err;
 
     err = fp_hook_syscalln(__NR_pread64, 4, before_pread64, 0, 0);
@@ -227,7 +192,7 @@ static long init(const char *args, const char *event, void *__user reserved)
     err = fp_hook_syscalln(__NR_process_vm_writev, 6, before_process_vm_writev, 0, 0);
     if (err) printk(KERN_ERR "KMS: hook process_vm_writev failed %d\n", err);
 
-    printk(KERN_INFO "KMS: loaded, hooks installed (PID filter ready)\n");
+    printk(KERN_INFO "KMS: loaded, hooks installed (PID filter for VM calls)\n");
     return 0;
 }
 

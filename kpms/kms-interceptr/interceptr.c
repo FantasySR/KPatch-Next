@@ -1,10 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * KernelMemorySky - 终极增强拦截器
- * - Hook pread64, pwrite64, process_vm_readv, process_vm_writev
- * - prw: 学习/监控 + fd 阈值过滤
- * - vm: 强制 PID 过滤（未设 PID 时不输出）
- * - CTL0 命令: clear, start, stop, pid=XXX, off, fdmax=N
+ * KernelMemorySky - 增强拦截器 (地址可见版)
+ * - pread64/pwrite64: 监控模式下输出十六进制 POS, BUF, DATA
+ * - process_vm_*: 仅当目标 PID 设置时输出
+ * - 命令: clear, start, stop, pid=XXX, off, fdmax=N
  */
 
 #include <compiler.h>
@@ -17,28 +16,25 @@
 #include <asm/current.h>
 
 KPM_NAME("KernelMemorySky");
-KPM_VERSION("6.1.0");
+KPM_VERSION("6.2.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Enhanced interceptor with fd filter and vm pid-only");
+KPM_DESCRIPTION("Enhanced interceptor with hex POS and data dump");
 
 #define HASH_SIZE 1024
 static u64 call_table[HASH_SIZE] = {0};
 static int call_count = 0;
-static int learn_mode = 1;
+static int learn_mode = 1;         // 1=学习, 0=监控
 static int target_pid = 0;
-static int fd_max = 0;          // 0 表示不过滤
+static int fd_max = 0;             // 0 表示不过滤
 
 /* ---- 哈希函数 ---- */
 static u64 hash_signature(int fd, loff_t pos, size_t count, const unsigned char *data, int data_len)
 {
     u64 hash = 14695981039346656037ULL;
-    hash ^= (u64)fd;
-    hash *= 1099511628211ULL;
-    hash ^= (u64)pos;
-    hash *= 1099511628211ULL;
-    hash ^= (u64)count;
-    hash *= 1099511628211ULL;
+    hash ^= (u64)fd;        hash *= 1099511628211ULL;
+    hash ^= (u64)pos;       hash *= 1099511628211ULL;
+    hash ^= (u64)count;     hash *= 1099511628211ULL;
     for (int i = 0; i < data_len; i++) {
         hash ^= data[i];
         hash *= 1099511628211ULL;
@@ -77,14 +73,14 @@ static void clear_table(void)
     printk(KERN_INFO "KMS: hash table cleared\n");
 }
 
-/* ---- 安全读取数据样本 ---- */
+/* ---- 安全读取数据样本（最多 8 字节） ---- */
 static void read_data_sample(const void __user *buf, size_t count, unsigned char *out, int *out_len)
 {
     if (!buf || count == 0) {
         *out_len = 0;
         return;
     }
-    int len = count < 32 ? count : 32;
+    int len = count < 8 ? count : 8;
     if (compat_strncpy_from_user((char *)out, (const char __user *)buf, len) > 0) {
         *out_len = len;
     } else {
@@ -92,7 +88,15 @@ static void read_data_sample(const void __user *buf, size_t count, unsigned char
     }
 }
 
-/* ---- CTL0 控制命令（新增 fdmax） ---- */
+/* ---- 打印十六进制数据区块 ---- */
+static void print_hex(const unsigned char *data, int len)
+{
+    for (int i = 0; i < len; i++) {
+        printk(KERN_INFO " %02x", data[i]);
+    }
+}
+
+/* ---- CTL0 控制命令 ---- */
 static long interceptor_control0(const char *args, char *__user out_msg, int outlen)
 {
     if (!args) {
@@ -144,7 +148,7 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
     return 0;
 }
 
-/* ---- prw Hook（加入 fd 判断） ---- */
+/* ---- prw Hook（增强输出） ---- */
 static void before_pread64(hook_fargs4_t *fargs, void *udata)
 {
     int fd = (int)syscall_argn(fargs, 0);
@@ -155,7 +159,7 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
     // fd 阈值过滤（0 表示不过滤）
     if (fd_max > 0 && fd > fd_max) return;
 
-    unsigned char sample[32];
+    unsigned char sample[8];
     int sample_len = 0;
     read_data_sample(buf, count, sample, &sample_len);
     u64 sig = hash_signature(fd, pos, count, sample, sample_len);
@@ -164,7 +168,15 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
         insert_signature(sig);
     } else {
         if (!is_signature_present(sig)) {
-            printk(KERN_INFO "KMS| pread64 | FD=%d POS=%lld SIZE=%zu\n", fd, pos, count);
+            if (sample_len > 0) {
+                printk(KERN_INFO "KMS| pread64 | FD=%d POS=0x%llx SIZE=%zu BUF=%px DATA=",
+                       fd, pos, count, buf);
+                print_hex(sample, sample_len);
+                printk(KERN_INFO "\n");
+            } else {
+                printk(KERN_INFO "KMS| pread64 | FD=%d POS=0x%llx SIZE=%zu BUF=%px\n",
+                       fd, pos, count, buf);
+            }
         }
     }
 }
@@ -178,7 +190,7 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
 
     if (fd_max > 0 && fd > fd_max) return;
 
-    unsigned char sample[32];
+    unsigned char sample[8];
     int sample_len = 0;
     read_data_sample(buf, count, sample, &sample_len);
     u64 sig = hash_signature(fd, pos, count, sample, sample_len);
@@ -187,16 +199,23 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
         insert_signature(sig);
     } else {
         if (!is_signature_present(sig)) {
-            printk(KERN_INFO "KMS| pwrite64 | FD=%d POS=%lld SIZE=%zu\n", fd, pos, count);
+            if (sample_len > 0) {
+                printk(KERN_INFO "KMS| pwrite64 | FD=%d POS=0x%llx SIZE=%zu BUF=%px DATA=",
+                       fd, pos, count, buf);
+                print_hex(sample, sample_len);
+                printk(KERN_INFO "\n");
+            } else {
+                printk(KERN_INFO "KMS| pwrite64 | FD=%d POS=0x%llx SIZE=%zu BUF=%px\n",
+                       fd, pos, count, buf);
+            }
         }
     }
 }
 
-/* ---- vm Hook（必须 PID 过滤） ---- */
+/* ---- vm Hook（强制 PID 过滤） ---- */
 static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
 {
     pid_t tpid = (pid_t)syscall_argn(fargs, 0);
-    // 仅当 target_pid > 0 且匹配时才输出
     if (target_pid <= 0 || tpid != target_pid) return;
     printk(KERN_INFO "KMS| process_vm_readv | TARGET=%d\n", tpid);
 }
@@ -221,7 +240,7 @@ static long init(const char *args, const char *event, void *__user reserved)
     err = fp_hook_syscalln(__NR_process_vm_writev, 6, before_process_vm_writev, 0, 0);
     if (err) printk(KERN_ERR "KMS: hook process_vm_writev fail %d\n", err);
 
-    printk(KERN_INFO "KMS: loaded (v6.1.0, learning mode)\n");
+    printk(KERN_INFO "KMS: loaded (v6.2.0, learning mode)\n");
     return 0;
 }
 

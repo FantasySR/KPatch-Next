@@ -1,14 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * KernelMemorySky - 完整拦截器（文件状态标记版）
+ * KernelMemorySky - 完整拦截器 v6.4.0
  * 功能:
  * - Hook pread64, pwrite64, process_vm_readv, process_vm_writev
- * - 学习/监控模式（哈希表去重）
- * - fd 阈值过滤（fdmax=N）
- * - vm 强制 PID 过滤（未设 PID 不输出）
- * - 增强日志（POS 十六进制, BUF, DATA）
- * - 文件系统状态标记 /data/local/tmp/kms_loaded
- * - CTL0 命令: clear, start, stop, pid=XXX, off, fdmax=N
+ * - 学习/监控模式 (哈希表去重)
+ * - fd 阈值过滤 (fdmax=N)
+ * - vm 强制 PID 过滤 (pid=XXX)
+ * - 输出格式切换 (fmt=0 分析模式, fmt=1 原生模式)
+ * - CTL0 命令: clear, start, stop, pid=, fdmax=, fmt=
+ * - 文件状态标记 /data/local/tmp/kms_loaded (加载创建，卸载删除)
+ * - 所有外部函数通过 kallsyms 动态获取
  */
 
 #include <compiler.h>
@@ -21,24 +22,39 @@
 #include <asm/current.h>
 
 KPM_NAME("KernelMemorySky");
-KPM_VERSION("6.3.0");
+KPM_VERSION("6.4.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Full-featured interceptor with file status mark");
+KPM_DESCRIPTION("Full-featured interceptor with format switch and file status");
+
+/* ---------- 手动补充缺失的宏和类型 ---------- */
+#ifndef O_CREAT
+#define O_CREAT  0x40
+#endif
+#ifndef O_WRONLY
+#define O_WRONLY 0x1
+#endif
+#ifndef O_TRUNC
+#define O_TRUNC  0x200
+#endif
+
+#define IS_ERR(x) ((unsigned long)(void *)(x) >= (unsigned long)(-4095))
+typedef void *fl_owner_t;
+
+/* 文件操作函数指针 */
+typedef struct file *(*filp_open_t)(const char *, int, umode_t);
+typedef ssize_t (*kernel_write_t)(struct file *, const void *, size_t, loff_t *);
+typedef int (*filp_close_t)(struct file *, fl_owner_t);
+typedef int (*ksys_unlink_t)(const char *);
 
 /* ---------- 哈希表 ---------- */
 #define HASH_SIZE 1024
 static u64 call_table[HASH_SIZE] = {0};
 static int call_count = 0;
-static int learn_mode = 1;         // 1=学习, 0=监控
+static int learn_mode = 1;        /* 1=学习, 0=监控 */
+static int output_format = 0;     /* 0=分析模式, 1=原生模式 */
 static int target_pid = 0;
-static int fd_max = 0;             // 0=不过滤
-
-/* ---------- 文件操作函数指针 ---------- */
-typedef struct file *(*filp_open_t)(const char *, int, umode_t);
-typedef ssize_t (*kernel_write_t)(struct file *, const void *, size_t, loff_t *);
-typedef int (*filp_close_t)(struct file *, fl_owner_t);
-typedef int (*ksys_unlink_t)(const char *);
+static int fd_max = 0;            /* 0=不过滤 */
 
 static filp_open_t filp_open_ptr = NULL;
 static kernel_write_t kernel_write_ptr = NULL;
@@ -46,7 +62,8 @@ static filp_close_t filp_close_ptr = NULL;
 static ksys_unlink_t ksys_unlink_ptr = NULL;
 
 /* ---------- 哈希函数 ---------- */
-static u64 hash_signature(int fd, loff_t pos, size_t count, const unsigned char *data, int data_len)
+static u64 hash_signature(int fd, loff_t pos, size_t count,
+                          const unsigned char *data, int data_len)
 {
     u64 hash = 14695981039346656037ULL;
     hash ^= (u64)fd;        hash *= 1099511628211ULL;
@@ -90,8 +107,9 @@ static void clear_table(void)
     printk(KERN_INFO "KMS: hash table cleared\n");
 }
 
-/* ---------- 安全读取数据样本 ---------- */
-static void read_data_sample(const void __user *buf, size_t count, unsigned char *out, int *out_len)
+/* ---------- 安全读取数据样本（最多 8 字节） ---------- */
+static void read_data_sample(const void __user *buf, size_t count,
+                             unsigned char *out, int *out_len)
 {
     if (!buf || count == 0) {
         *out_len = 0;
@@ -105,7 +123,7 @@ static void read_data_sample(const void __user *buf, size_t count, unsigned char
     }
 }
 
-/* ---------- 辅助：十六进制打印 ---------- */
+/* ---------- 辅助: 十六进制打印 ---------- */
 static void print_hex(const unsigned char *data, int len)
 {
     for (int i = 0; i < len; i++) {
@@ -113,7 +131,7 @@ static void print_hex(const unsigned char *data, int len)
     }
 }
 
-/* ---------- CTL0 控制 ---------- */
+/* ---------- CTL0 控制命令 ---------- */
 static long interceptor_control0(const char *args, char *__user out_msg, int outlen)
 {
     if (!args) {
@@ -130,8 +148,10 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
         if (out_msg && outlen > 0) strncpy(out_msg, "monitoring", outlen);
     } else if (strcmp(args, "stop") == 0) {
         learn_mode = 1;
-        printk(KERN_INFO "KMS: learning mode\n");
-        if (out_msg && outlen > 0) strncpy(out_msg, "learning", outlen);
+        target_pid = 0;
+        fd_max = 0;
+        printk(KERN_INFO "KMS: stopped, filters cleared\n");
+        if (out_msg && outlen > 0) strncpy(out_msg, "stopped+cleared", outlen);
     } else if (strncmp(args, "pid=", 4) == 0) {
         const char *p = args + 4;
         int pid = 0;
@@ -154,10 +174,16 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
         fd_max = val;
         printk(KERN_INFO "KMS: fd_max set to %d\n", fd_max);
         if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
-    } else if (strcmp(args, "off") == 0) {
-        target_pid = 0;
-        fd_max = 0;
-        printk(KERN_INFO "KMS: PID and FD filters off\n");
+    } else if (strncmp(args, "fmt=", 4) == 0) {
+        const char *p = args + 4;
+        int val = 0;
+        while (*p >= '0' && *p <= '9') val = val * 10 + (*p++ - '0');
+        if (*p != '\0' || (val != 0 && val != 1)) {
+            if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
+            return -EINVAL;
+        }
+        output_format = val;
+        printk(KERN_INFO "KMS: output format set to %d\n", output_format);
         if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
     } else {
         if (out_msg && outlen > 0) strncpy(out_msg, "unknown", outlen);
@@ -173,7 +199,7 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
     size_t count = (size_t)syscall_argn(fargs, 2);
     loff_t pos = (loff_t)syscall_argn(fargs, 3);
 
-    // fd 阈值过滤
+    /* fd 阈值过滤 */
     if (fd_max > 0 && fd > fd_max) return;
 
     unsigned char sample[8];
@@ -185,14 +211,19 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
         insert_signature(sig);
     } else {
         if (!is_signature_present(sig)) {
-            if (sample_len > 0) {
-                printk(KERN_INFO "KMS| pread64 | FD=%d POS=0x%llx SIZE=%zu BUF=%px DATA=",
-                       fd, pos, count, buf);
-                print_hex(sample, sample_len);
-                printk(KERN_INFO "\n");
+            if (output_format == 1) {
+                /* 原生模式: pread64(fd, buf, count, pos) */
+                printk(KERN_INFO "KMS| pread64(%d, 0x%x, %zu, 0x%llx)\n",
+                       fd, buf, count, pos);
             } else {
-                printk(KERN_INFO "KMS| pread64 | FD=%d POS=0x%llx SIZE=%zu BUF=%px\n",
-                       fd, pos, count, buf);
+                /* 分析模式: 详细字段 */
+                printk(KERN_INFO "KMS| pread64 | FD=%d BUF=%px COUNT=%zu POS=0x%llx",
+                       fd, buf, count, pos);
+                if (sample_len > 0) {
+                    printk(KERN_INFO " DATA=");
+                    print_hex(sample, sample_len);
+                }
+                printk(KERN_INFO "\n");
             }
         }
     }
@@ -217,14 +248,17 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
         insert_signature(sig);
     } else {
         if (!is_signature_present(sig)) {
-            if (sample_len > 0) {
-                printk(KERN_INFO "KMS| pwrite64 | FD=%d POS=0x%llx SIZE=%zu BUF=%px DATA=",
-                       fd, pos, count, buf);
-                print_hex(sample, sample_len);
-                printk(KERN_INFO "\n");
+            if (output_format == 1) {
+                printk(KERN_INFO "KMS| pwrite64(%d, 0x%x, %zu, 0x%llx)\n",
+                       fd, buf, count, pos);
             } else {
-                printk(KERN_INFO "KMS| pwrite64 | FD=%d POS=0x%llx SIZE=%zu BUF=%px\n",
-                       fd, pos, count, buf);
+                printk(KERN_INFO "KMS| pwrite64 | FD=%d BUF=%px COUNT=%zu POS=0x%llx",
+                       fd, buf, count, pos);
+                if (sample_len > 0) {
+                    printk(KERN_INFO " DATA=");
+                    print_hex(sample, sample_len);
+                }
+                printk(KERN_INFO "\n");
             }
         }
     }
@@ -280,7 +314,7 @@ static long init(const char *args, const char *event, void *__user reserved)
         }
     }
 
-    printk(KERN_INFO "KMS: loaded (v6.3.0, learning mode)\n");
+    printk(KERN_INFO "KMS: loaded (v6.4.0, fmt=%d)\n", output_format);
     return 0;
 }
 

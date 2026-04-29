@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * KernelMemorySky - 终极拦截器 v6.5.3
- * 可配置进程内 VM 调用过滤，全部命令见简介
+ * KernelMemorySky - 终极拦截器 v6.5.5
+ * 内核态精准过滤游戏自身 VM 调用
  */
 
 #include <compiler.h>
@@ -14,10 +14,10 @@
 #include <asm/current.h>
 
 KPM_NAME("KernelMemorySky");
-KPM_VERSION("6.5.3");
+KPM_VERSION("6.5.5");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("clear|start|stop|pid=N|fdmax=N|fmt=0/1|vm_no_local=0/1");
+KPM_DESCRIPTION("clear|start|stop|pid=N|fdmax=N|fmt=0/1|vm_lio_mark=XX");
 
 /* ---------- 手动补充缺失的宏和类型 ---------- */
 #ifndef O_CREAT
@@ -33,7 +33,6 @@ KPM_DESCRIPTION("clear|start|stop|pid=N|fdmax=N|fmt=0/1|vm_no_local=0/1");
 #define IS_ERR(x) ((unsigned long)(void *)(x) >= (unsigned long)(-4095))
 typedef void *fl_owner_t;
 
-/* 文件操作函数指针 */
 typedef struct file *(*filp_open_t)(const char *, int, umode_t);
 typedef ssize_t (*kernel_write_t)(struct file *, const void *, size_t, loff_t *);
 typedef int (*filp_close_t)(struct file *, fl_owner_t);
@@ -43,10 +42,11 @@ typedef int (*filp_close_t)(struct file *, fl_owner_t);
 static u64 call_table[HASH_SIZE] = {0};
 static int call_count = 0;
 static int learn_mode = 1;        /* 1=学习, 0=监控 */
-static int output_format = 0;     /* 0=分析模式, 1=原生模式 */
+static int output_format = 0;     /* 0=分析, 1=原生 */
 static int target_pid = 0;
-static int fd_max = 0;            /* 0=不过滤 */
-static int vm_no_local = 0;       /* 0=不过滤进程内VM调用, 1=过滤 */
+static int fd_max = 0;
+static int vm_lio_mark = 0;       /* 0=不过滤, 非0=本地地址高8位与此相等则过滤 */
+static int vm_lio_mask = 0xff000000;
 
 static filp_open_t filp_open_ptr = NULL;
 static kernel_write_t kernel_write_ptr = NULL;
@@ -136,7 +136,7 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
         learn_mode = 1;
         target_pid = 0;
         fd_max = 0;
-        vm_no_local = 0;          // 同时关闭进程内过滤
+        vm_lio_mark = 0;
         printk(KERN_INFO "KMS: stopped, filters cleared\n");
         if (out_msg && outlen > 0) strncpy(out_msg, "stopped+cleared", outlen);
     } else if (strncmp(args, "pid=", 4) == 0) {
@@ -172,16 +172,20 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
         output_format = val;
         printk(KERN_INFO "KMS: output format set to %d\n", output_format);
         if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
-    } else if (strncmp(args, "vm_no_local=", 12) == 0) {
+    } else if (strncmp(args, "vm_lio_mark=", 12) == 0) {
         const char *p = args + 12;
         int val = 0;
-        while (*p >= '0' && *p <= '9') val = val * 10 + (*p++ - '0');
-        if (*p != '\0' || (val != 0 && val != 1)) {
+        if (*p == '0' && (*(p+1) == 'x' || *(p+1) == 'X')) p += 2;
+        while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) {
+            val = val * 16 + (*p >= 'A' ? ((*p & 0xDF) - 'A' + 10) : (*p - '0'));
+            p++;
+        }
+        if (*p != '\0' || val < 0 || val > 0xff) {
             if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
             return -EINVAL;
         }
-        vm_no_local = val;
-        printk(KERN_INFO "KMS: vm_no_local set to %d\n", vm_no_local);
+        vm_lio_mark = val;
+        printk(KERN_INFO "KMS: vm_lio_mark set to 0x%02x\n", val);
         if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
     } else {
         if (out_msg && outlen > 0) strncpy(out_msg, "unknown", outlen);
@@ -267,8 +271,8 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
     unsigned long riovcnt = (unsigned long)syscall_argn(fargs, 4);
     unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
 
-    // 可配置进程内调用过滤
-    if (vm_no_local && (uintptr_t)local_iov >> 32 == (uintptr_t)remote_iov >> 32) return;
+    // 本地地址前缀过滤
+    if (vm_lio_mark && (((uintptr_t)local_iov >> 24) & 0xff) == vm_lio_mark) return;
 
     if (target_pid > 0) {
         if (tpid == target_pid) {
@@ -313,8 +317,8 @@ static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
     unsigned long riovcnt = (unsigned long)syscall_argn(fargs, 4);
     unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
 
-    // 可配置进程内调用过滤
-    if (vm_no_local && (uintptr_t)local_iov >> 32 == (uintptr_t)remote_iov >> 32) return;
+    // 本地地址前缀过滤
+    if (vm_lio_mark && (((uintptr_t)local_iov >> 24) & 0xff) == vm_lio_mark) return;
 
     if (target_pid > 0) {
         if (tpid == target_pid) {
@@ -378,7 +382,7 @@ static long init(const char *args, const char *event, void *__user reserved)
         }
     }
 
-    printk(KERN_INFO "KMS: loaded (v6.5.3, fmt=%d)\n", output_format);
+    printk(KERN_INFO "KMS: loaded (v6.5.5, fmt=%d)\n", output_format);
     return 0;
 }
 

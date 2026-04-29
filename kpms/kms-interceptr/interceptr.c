@@ -1,11 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * KernelMemorySky - 终极智能拦截器（学习+监控模式）
- * 功能：
+ * KernelMemorySky - 终极增强拦截器
  * - Hook pread64, pwrite64, process_vm_readv, process_vm_writev
- * - 学习模式：记录调用特征，不输出日志
- * - 监控模式：只输出哈希表中不存在的未知调用
- * - CTL0 命令：clear, start, stop, pid=XXX, off
+ * - prw: 学习/监控 + fd 阈值过滤
+ * - vm: 强制 PID 过滤（未设 PID 时不输出）
+ * - CTL0 命令: clear, start, stop, pid=XXX, off, fdmax=N
  */
 
 #include <compiler.h>
@@ -18,32 +17,28 @@
 #include <asm/current.h>
 
 KPM_NAME("KernelMemorySky");
-KPM_VERSION("6.0.0");
+KPM_VERSION("6.1.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Smart interceptor with learning/monitoring mode");
+KPM_DESCRIPTION("Enhanced interceptor with fd filter and vm pid-only");
 
-/* ---------- 哈希表定义 ---------- */
-#define HASH_SIZE 1024                     // 哈希表大小（可根据内存调整）
-static u64 call_table[HASH_SIZE] = {0};    // 签名表，0 表示空槽
-static int call_count = 0;                 // 当前已用槽数
-static int learn_mode = 1;                 // 1=学习模式（记录），0=监控模式（输出未知）
-static int target_pid = 0;                 // process_vm 的 PID 过滤
+#define HASH_SIZE 1024
+static u64 call_table[HASH_SIZE] = {0};
+static int call_count = 0;
+static int learn_mode = 1;
+static int target_pid = 0;
+static int fd_max = 0;          // 0 表示不过滤
 
-/* ---------- 简易哈希函数（FNV-1a 变体） ---------- */
+/* ---- 哈希函数 ---- */
 static u64 hash_signature(int fd, loff_t pos, size_t count, const unsigned char *data, int data_len)
 {
-    u64 hash = 14695981039346656037ULL; // FNV offset basis
-    // 混合 fd
+    u64 hash = 14695981039346656037ULL;
     hash ^= (u64)fd;
     hash *= 1099511628211ULL;
-    // 混合 pos
     hash ^= (u64)pos;
     hash *= 1099511628211ULL;
-    // 混合 count
     hash ^= (u64)count;
     hash *= 1099511628211ULL;
-    // 混合数据前 32 字节
     for (int i = 0; i < data_len; i++) {
         hash ^= data[i];
         hash *= 1099511628211ULL;
@@ -51,14 +46,12 @@ static u64 hash_signature(int fd, loff_t pos, size_t count, const unsigned char 
     return hash;
 }
 
-/* ---------- 哈希表操作 ---------- */
 static int is_signature_present(u64 sig)
 {
     int idx = sig % HASH_SIZE;
     int tried = 0;
     while (call_table[idx] != 0 && tried < HASH_SIZE) {
-        if (call_table[idx] == sig)
-            return 1; // 找到
+        if (call_table[idx] == sig) return 1;
         idx = (idx + 1) % HASH_SIZE;
         tried++;
     }
@@ -67,12 +60,10 @@ static int is_signature_present(u64 sig)
 
 static void insert_signature(u64 sig)
 {
-    if (call_count >= HASH_SIZE)
-        return; // 表满，无法插入
+    if (call_count >= HASH_SIZE) return;
     int idx = sig % HASH_SIZE;
     while (call_table[idx] != 0) {
-        if (call_table[idx] == sig)
-            return; // 已存在，不重复插入
+        if (call_table[idx] == sig) return;
         idx = (idx + 1) % HASH_SIZE;
     }
     call_table[idx] = sig;
@@ -86,7 +77,7 @@ static void clear_table(void)
     printk(KERN_INFO "KMS: hash table cleared\n");
 }
 
-/* ---------- 辅助：从用户空间安全读取前 32 字节数据 ---------- */
+/* ---- 安全读取数据样本 ---- */
 static void read_data_sample(const void __user *buf, size_t count, unsigned char *out, int *out_len)
 {
     if (!buf || count == 0) {
@@ -101,7 +92,7 @@ static void read_data_sample(const void __user *buf, size_t count, unsigned char
     }
 }
 
-/* ---------- CTL0 控制命令 ---------- */
+/* ---- CTL0 控制命令（新增 fdmax） ---- */
 static long interceptor_control0(const char *args, char *__user out_msg, int outlen)
 {
     if (!args) {
@@ -114,11 +105,11 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
         if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
     } else if (strcmp(args, "start") == 0) {
         learn_mode = 0;
-        printk(KERN_INFO "KMS: monitoring mode (output unknown)\n");
+        printk(KERN_INFO "KMS: monitoring mode\n");
         if (out_msg && outlen > 0) strncpy(out_msg, "monitoring", outlen);
     } else if (strcmp(args, "stop") == 0) {
         learn_mode = 1;
-        printk(KERN_INFO "KMS: learning mode (recording)\n");
+        printk(KERN_INFO "KMS: learning mode\n");
         if (out_msg && outlen > 0) strncpy(out_msg, "learning", outlen);
     } else if (strncmp(args, "pid=", 4) == 0) {
         const char *p = args + 4;
@@ -129,11 +120,23 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
             return -EINVAL;
         }
         target_pid = pid;
-        printk(KERN_INFO "KMS: PID filter set to %d\n", target_pid);
+        printk(KERN_INFO "KMS: target PID = %d\n", target_pid);
+        if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
+    } else if (strncmp(args, "fdmax=", 6) == 0) {
+        const char *p = args + 6;
+        int val = 0;
+        while (*p >= '0' && *p <= '9') val = val * 10 + (*p++ - '0');
+        if (*p != '\0' || val < 0) {
+            if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
+            return -EINVAL;
+        }
+        fd_max = val;
+        printk(KERN_INFO "KMS: fd_max set to %d\n", fd_max);
         if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
     } else if (strcmp(args, "off") == 0) {
         target_pid = 0;
-        printk(KERN_INFO "KMS: PID filter off\n");
+        fd_max = 0;
+        printk(KERN_INFO "KMS: PID and FD filters off\n");
         if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
     } else {
         if (out_msg && outlen > 0) strncpy(out_msg, "unknown", outlen);
@@ -141,7 +144,7 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
     return 0;
 }
 
-/* ---------- prw Hook 回调（学习/监控逻辑） ---------- */
+/* ---- prw Hook（加入 fd 判断） ---- */
 static void before_pread64(hook_fargs4_t *fargs, void *udata)
 {
     int fd = (int)syscall_argn(fargs, 0);
@@ -149,16 +152,17 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
     size_t count = (size_t)syscall_argn(fargs, 2);
     loff_t pos = (loff_t)syscall_argn(fargs, 3);
 
+    // fd 阈值过滤（0 表示不过滤）
+    if (fd_max > 0 && fd > fd_max) return;
+
     unsigned char sample[32];
     int sample_len = 0;
     read_data_sample(buf, count, sample, &sample_len);
     u64 sig = hash_signature(fd, pos, count, sample, sample_len);
 
     if (learn_mode) {
-        // 学习模式：只记录，不输出
         insert_signature(sig);
     } else {
-        // 监控模式：仅输出表中不存在的调用
         if (!is_signature_present(sig)) {
             printk(KERN_INFO "KMS| pread64 | FD=%d POS=%lld SIZE=%zu\n", fd, pos, count);
         }
@@ -171,6 +175,8 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
     const void __user *buf = (const void __user *)syscall_argn(fargs, 1);
     size_t count = (size_t)syscall_argn(fargs, 2);
     loff_t pos = (loff_t)syscall_argn(fargs, 3);
+
+    if (fd_max > 0 && fd > fd_max) return;
 
     unsigned char sample[32];
     int sample_len = 0;
@@ -186,24 +192,23 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
     }
 }
 
-/* ---------- process_vm Hook（保留 PID 过滤） ---------- */
+/* ---- vm Hook（必须 PID 过滤） ---- */
 static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
 {
     pid_t tpid = (pid_t)syscall_argn(fargs, 0);
-    if (target_pid > 0 && tpid != target_pid)
-        return;
+    // 仅当 target_pid > 0 且匹配时才输出
+    if (target_pid <= 0 || tpid != target_pid) return;
     printk(KERN_INFO "KMS| process_vm_readv | TARGET=%d\n", tpid);
 }
 
 static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
 {
     pid_t tpid = (pid_t)syscall_argn(fargs, 0);
-    if (target_pid > 0 && tpid != target_pid)
-        return;
+    if (target_pid <= 0 || tpid != target_pid) return;
     printk(KERN_INFO "KMS| process_vm_writev | TARGET=%d\n", tpid);
 }
 
-/* ---------- 模块初始化 ---------- */
+/* ---- 模块生命周期 ---- */
 static long init(const char *args, const char *event, void *__user reserved)
 {
     hook_err_t err;
@@ -216,7 +221,7 @@ static long init(const char *args, const char *event, void *__user reserved)
     err = fp_hook_syscalln(__NR_process_vm_writev, 6, before_process_vm_writev, 0, 0);
     if (err) printk(KERN_ERR "KMS: hook process_vm_writev fail %d\n", err);
 
-    printk(KERN_INFO "KMS: loaded (learning mode)\n");
+    printk(KERN_INFO "KMS: loaded (v6.1.0, learning mode)\n");
     return 0;
 }
 

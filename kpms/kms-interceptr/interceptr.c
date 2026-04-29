@@ -243,20 +243,95 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
     }
 }
 
-/* ---------- process_vm_readv Hook ---------- */
+/* ---------- process_vm_readv Hook (双模态) ---------- */
 static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
 {
     pid_t tpid = (pid_t)syscall_argn(fargs, 0);
-    if (target_pid <= 0 || tpid != target_pid) return;
-    printk(KERN_INFO "KMS| process_vm_readv | TARGET=%d\n", tpid);
+    void __user *local_iov = (void __user *)syscall_argn(fargs, 1);
+    unsigned long liovcnt = (unsigned long)syscall_argn(fargs, 2);
+    void __user *remote_iov = (void __user *)syscall_argn(fargs, 3);
+    unsigned long riovcnt = (unsigned long)syscall_argn(fargs, 4);
+    unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
+
+    // 模式1：精准PID过滤（用户设置了 target_pid）
+    if (target_pid > 0) {
+        if (tpid == target_pid) {
+            if (output_format == 1) {
+                printk(KERN_INFO "KMS| process_vm_readv(%d, 0x%x, %lu, 0x%x, %lu, %lu)\n",
+                       tpid, local_iov, liovcnt, remote_iov, riovcnt, flags);
+            } else {
+                printk(KERN_INFO "KMS| process_vm_readv | TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
+                       tpid, local_iov, liovcnt, remote_iov, riovcnt, flags);
+            }
+        }
+        return;
+    }
+
+    // 模式2：哈希表模式（未设置 PID）
+    // 构建 VM 专用签名（混合目标 PID、本地/远程 iov 基址和计数）
+    unsigned char extra_data[16];
+    memcpy(extra_data, &liovcnt, sizeof(liovcnt));
+    memcpy(extra_data + 8, &riovcnt, sizeof(riovcnt));
+    u64 sig = hash_signature((int)tpid, (loff_t)local_iov, (size_t)remote_iov, extra_data, sizeof(extra_data));
+
+    if (learn_mode) {
+        insert_signature(sig);
+    } else {
+        if (!is_signature_present(sig)) {
+            if (output_format == 1) {
+                printk(KERN_INFO "KMS| process_vm_readv(%d, 0x%x, %lu, 0x%x, %lu, %lu)\n",
+                       tpid, local_iov, liovcnt, remote_iov, riovcnt, flags);
+            } else {
+                printk(KERN_INFO "KMS| process_vm_readv | TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
+                       tpid, local_iov, liovcnt, remote_iov, riovcnt, flags);
+            }
+        }
+    }
 }
 
-/* ---------- process_vm_writev Hook ---------- */
+/* ---------- process_vm_writev Hook (双模态) ---------- */
 static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
 {
     pid_t tpid = (pid_t)syscall_argn(fargs, 0);
-    if (target_pid <= 0 || tpid != target_pid) return;
-    printk(KERN_INFO "KMS| process_vm_writev | TARGET=%d\n", tpid);
+    void __user *local_iov = (void __user *)syscall_argn(fargs, 1);
+    unsigned long liovcnt = (unsigned long)syscall_argn(fargs, 2);
+    void __user *remote_iov = (void __user *)syscall_argn(fargs, 3);
+    unsigned long riovcnt = (unsigned long)syscall_argn(fargs, 4);
+    unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
+
+    // 模式1：精准PID过滤
+    if (target_pid > 0) {
+        if (tpid == target_pid) {
+            if (output_format == 1) {
+                printk(KERN_INFO "KMS| process_vm_writev(%d, 0x%x, %lu, 0x%x, %lu, %lu)\n",
+                       tpid, local_iov, liovcnt, remote_iov, riovcnt, flags);
+            } else {
+                printk(KERN_INFO "KMS| process_vm_writev | TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
+                       tpid, local_iov, liovcnt, remote_iov, riovcnt, flags);
+            }
+        }
+        return;
+    }
+
+    // 模式2：哈希表模式
+    unsigned char extra_data[16];
+    memcpy(extra_data, &liovcnt, sizeof(liovcnt));
+    memcpy(extra_data + 8, &riovcnt, sizeof(riovcnt));
+    u64 sig = hash_signature((int)tpid, (loff_t)local_iov, (size_t)remote_iov, extra_data, sizeof(extra_data));
+
+    if (learn_mode) {
+        insert_signature(sig);
+    } else {
+        if (!is_signature_present(sig)) {
+            if (output_format == 1) {
+                printk(KERN_INFO "KMS| process_vm_writev(%d, 0x%x, %lu, 0x%x, %lu, %lu)\n",
+                       tpid, local_iov, liovcnt, remote_iov, riovcnt, flags);
+            } else {
+                printk(KERN_INFO "KMS| process_vm_writev | TARGET=%d LIOV=%px LCNT=%lu RIOV=%px RCNT=%lu FLAGS=%lu\n",
+                       tpid, local_iov, liovcnt, remote_iov, riovcnt, flags);
+            }
+        }
+    }
 }
 
 /* ---------- 初始化 ---------- */

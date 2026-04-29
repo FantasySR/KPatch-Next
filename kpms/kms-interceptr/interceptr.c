@@ -1,9 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * KernelMemorySky - 增强拦截器 (地址可见版)
- * - pread64/pwrite64: 监控模式下输出十六进制 POS, BUF, DATA
- * - process_vm_*: 仅当目标 PID 设置时输出
- * - 命令: clear, start, stop, pid=XXX, off, fdmax=N
+ * KernelMemorySky - 完整拦截器（文件状态标记版）
+ * 功能:
+ * - Hook pread64, pwrite64, process_vm_readv, process_vm_writev
+ * - 学习/监控模式（哈希表去重）
+ * - fd 阈值过滤（fdmax=N）
+ * - vm 强制 PID 过滤（未设 PID 不输出）
+ * - 增强日志（POS 十六进制, BUF, DATA）
+ * - 文件系统状态标记 /data/local/tmp/kms_loaded
+ * - CTL0 命令: clear, start, stop, pid=XXX, off, fdmax=N
  */
 
 #include <compiler.h>
@@ -16,19 +21,31 @@
 #include <asm/current.h>
 
 KPM_NAME("KernelMemorySky");
-KPM_VERSION("6.2.0");
+KPM_VERSION("6.3.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Enhanced interceptor with hex POS and data dump");
+KPM_DESCRIPTION("Full-featured interceptor with file status mark");
 
+/* ---------- 哈希表 ---------- */
 #define HASH_SIZE 1024
 static u64 call_table[HASH_SIZE] = {0};
 static int call_count = 0;
 static int learn_mode = 1;         // 1=学习, 0=监控
 static int target_pid = 0;
-static int fd_max = 0;             // 0 表示不过滤
+static int fd_max = 0;             // 0=不过滤
 
-/* ---- 哈希函数 ---- */
+/* ---------- 文件操作函数指针 ---------- */
+typedef struct file *(*filp_open_t)(const char *, int, umode_t);
+typedef ssize_t (*kernel_write_t)(struct file *, const void *, size_t, loff_t *);
+typedef int (*filp_close_t)(struct file *, fl_owner_t);
+typedef int (*ksys_unlink_t)(const char *);
+
+static filp_open_t filp_open_ptr = NULL;
+static kernel_write_t kernel_write_ptr = NULL;
+static filp_close_t filp_close_ptr = NULL;
+static ksys_unlink_t ksys_unlink_ptr = NULL;
+
+/* ---------- 哈希函数 ---------- */
 static u64 hash_signature(int fd, loff_t pos, size_t count, const unsigned char *data, int data_len)
 {
     u64 hash = 14695981039346656037ULL;
@@ -73,7 +90,7 @@ static void clear_table(void)
     printk(KERN_INFO "KMS: hash table cleared\n");
 }
 
-/* ---- 安全读取数据样本（最多 8 字节） ---- */
+/* ---------- 安全读取数据样本 ---------- */
 static void read_data_sample(const void __user *buf, size_t count, unsigned char *out, int *out_len)
 {
     if (!buf || count == 0) {
@@ -88,7 +105,7 @@ static void read_data_sample(const void __user *buf, size_t count, unsigned char
     }
 }
 
-/* ---- 打印十六进制数据区块 ---- */
+/* ---------- 辅助：十六进制打印 ---------- */
 static void print_hex(const unsigned char *data, int len)
 {
     for (int i = 0; i < len; i++) {
@@ -96,7 +113,7 @@ static void print_hex(const unsigned char *data, int len)
     }
 }
 
-/* ---- CTL0 控制命令 ---- */
+/* ---------- CTL0 控制 ---------- */
 static long interceptor_control0(const char *args, char *__user out_msg, int outlen)
 {
     if (!args) {
@@ -148,7 +165,7 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
     return 0;
 }
 
-/* ---- prw Hook（增强输出） ---- */
+/* ---------- pread64 Hook ---------- */
 static void before_pread64(hook_fargs4_t *fargs, void *udata)
 {
     int fd = (int)syscall_argn(fargs, 0);
@@ -156,7 +173,7 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
     size_t count = (size_t)syscall_argn(fargs, 2);
     loff_t pos = (loff_t)syscall_argn(fargs, 3);
 
-    // fd 阈值过滤（0 表示不过滤）
+    // fd 阈值过滤
     if (fd_max > 0 && fd > fd_max) return;
 
     unsigned char sample[8];
@@ -181,6 +198,7 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
     }
 }
 
+/* ---------- pwrite64 Hook ---------- */
 static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
 {
     int fd = (int)syscall_argn(fargs, 0);
@@ -212,7 +230,7 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
     }
 }
 
-/* ---- vm Hook（强制 PID 过滤） ---- */
+/* ---------- process_vm_readv Hook ---------- */
 static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
 {
     pid_t tpid = (pid_t)syscall_argn(fargs, 0);
@@ -220,6 +238,7 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
     printk(KERN_INFO "KMS| process_vm_readv | TARGET=%d\n", tpid);
 }
 
+/* ---------- process_vm_writev Hook ---------- */
 static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
 {
     pid_t tpid = (pid_t)syscall_argn(fargs, 0);
@@ -227,7 +246,7 @@ static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
     printk(KERN_INFO "KMS| process_vm_writev | TARGET=%d\n", tpid);
 }
 
-/* ---- 模块生命周期 ---- */
+/* ---------- 模块初始化 ---------- */
 static long init(const char *args, const char *event, void *__user reserved)
 {
     hook_err_t err;
@@ -240,16 +259,49 @@ static long init(const char *args, const char *event, void *__user reserved)
     err = fp_hook_syscalln(__NR_process_vm_writev, 6, before_process_vm_writev, 0, 0);
     if (err) printk(KERN_ERR "KMS: hook process_vm_writev fail %d\n", err);
 
-    printk(KERN_INFO "KMS: loaded (v6.2.0, learning mode)\n");
+    /* 动态获取文件操作函数 */
+    filp_open_ptr = (filp_open_t)kallsyms_lookup_name("filp_open");
+    kernel_write_ptr = (kernel_write_t)kallsyms_lookup_name("kernel_write");
+    filp_close_ptr = (filp_close_t)kallsyms_lookup_name("filp_close");
+    ksys_unlink_ptr = (ksys_unlink_t)kallsyms_lookup_name("ksys_unlink");
+
+    /* 创建状态标记文件 */
+    if (filp_open_ptr && kernel_write_ptr && filp_close_ptr) {
+        struct file *fp = filp_open_ptr("/data/local/tmp/kms_loaded",
+                                        O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (!IS_ERR(fp)) {
+            char msg[] = "loaded";
+            loff_t pos = 0;
+            kernel_write_ptr(fp, msg, sizeof(msg), &pos);
+            filp_close_ptr(fp, NULL);
+            printk(KERN_INFO "KMS: status file created\n");
+        } else {
+            printk(KERN_ERR "KMS: cannot create status file\n");
+        }
+    }
+
+    printk(KERN_INFO "KMS: loaded (v6.3.0, learning mode)\n");
     return 0;
 }
 
+/* ---------- 模块卸载 ---------- */
 static long interceptr_exit(void *__user reserved)
 {
     fp_unhook_syscalln(__NR_pread64, before_pread64, 0);
     fp_unhook_syscalln(__NR_pwrite64, before_pwrite64, 0);
     fp_unhook_syscalln(__NR_process_vm_readv, before_process_vm_readv, 0);
     fp_unhook_syscalln(__NR_process_vm_writev, before_process_vm_writev, 0);
+
+    /* 删除状态标记文件 */
+    if (ksys_unlink_ptr) {
+        int ret = ksys_unlink_ptr("/data/local/tmp/kms_loaded");
+        if (ret == 0 || ret == -ENOENT) {
+            printk(KERN_INFO "KMS: status file removed\n");
+        } else {
+            printk(KERN_ERR "KMS: unlink failed: %d\n", ret);
+        }
+    }
+
     printk(KERN_INFO "KMS: unloaded\n");
     return 0;
 }

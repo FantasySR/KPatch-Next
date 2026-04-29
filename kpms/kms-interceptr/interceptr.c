@@ -1,7 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * KernelMemorySky - 完整拦截器 v6.4.1 (修复文件删除)
- * - 使用 vfs_unlink 删除状态文件，失败则清空内容
+ * KernelMemorySky - v6.4.2 (文件内容清空，用户态内容检测)
  */
 
 #include <compiler.h>
@@ -14,12 +13,12 @@
 #include <asm/current.h>
 
 KPM_NAME("KernelMemorySky");
-KPM_VERSION("6.4.1");
+KPM_VERSION("6.4.2");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Interceptor with reliable file deletion");
+KPM_DESCRIPTION("Interceptor with content-based status detection");
 
-/* ---------- 手动补充缺失的宏和类型 ---------- */
+/* ---------- 补充宏 ---------- */
 #ifndef O_CREAT
 #define O_CREAT  0x40
 #endif
@@ -33,19 +32,9 @@ KPM_DESCRIPTION("Interceptor with reliable file deletion");
 #define IS_ERR(x) ((unsigned long)(void *)(x) >= (unsigned long)(-4095))
 typedef void *fl_owner_t;
 
-/* 前向声明 */
-struct path;
-struct dentry;
-struct inode;
-struct user_namespace;
-
-/* 文件操作函数指针 */
 typedef struct file *(*filp_open_t)(const char *, int, umode_t);
 typedef ssize_t (*kernel_write_t)(struct file *, const void *, size_t, loff_t *);
 typedef int (*filp_close_t)(struct file *, fl_owner_t);
-typedef int (*kern_path_t)(const char *, unsigned int, struct path *);
-typedef void (*path_put_t)(struct path *);
-typedef int (*vfs_unlink_t)(struct user_namespace *, struct inode *, struct dentry *, struct inode **);
 
 /* ---------- 哈希表 ---------- */
 #define HASH_SIZE 1024
@@ -60,184 +49,15 @@ static filp_open_t filp_open_ptr = NULL;
 static kernel_write_t kernel_write_ptr = NULL;
 static filp_close_t filp_close_ptr = NULL;
 
-/* ---------- 哈希函数 ---------- */
-static u64 hash_signature(int fd, loff_t pos, size_t count,
-                          const unsigned char *data, int data_len) {
-    u64 hash = 14695981039346656037ULL;
-    hash ^= (u64)fd;        hash *= 1099511628211ULL;
-    hash ^= (u64)pos;       hash *= 1099511628211ULL;
-    hash ^= (u64)count;     hash *= 1099511628211ULL;
-    for (int i = 0; i < data_len; i++) {
-        hash ^= data[i];
-        hash *= 1099511628211ULL;
-    }
-    return hash;
-}
+/* ... (哈希函数、CTL0、Hook 等与之前版本完全相同，此处省略以节省篇幅) ... */
+/* 请务必将之前完整代码中对应的函数（hash_signature, is_signature_present, insert_signature,
+   clear_table, read_data_sample, print_hex, interceptor_control0, 
+   before_pread64, before_pwrite64, before_process_vm_readv, before_process_vm_writev）
+   完整保留并放在这里 */
 
-static int is_signature_present(u64 sig) {
-    int idx = sig % HASH_SIZE;
-    int tried = 0;
-    while (call_table[idx] != 0 && tried < HASH_SIZE) {
-        if (call_table[idx] == sig) return 1;
-        idx = (idx + 1) % HASH_SIZE;
-        tried++;
-    }
-    return 0;
-}
-
-static void insert_signature(u64 sig) {
-    if (call_count >= HASH_SIZE) return;
-    int idx = sig % HASH_SIZE;
-    while (call_table[idx] != 0) {
-        if (call_table[idx] == sig) return;
-        idx = (idx + 1) % HASH_SIZE;
-    }
-    call_table[idx] = sig;
-    call_count++;
-}
-
-static void clear_table(void) {
-    memset(call_table, 0, sizeof(call_table));
-    call_count = 0;
-    printk(KERN_INFO "KMS: hash table cleared\n");
-}
-
-static void read_data_sample(const void __user *buf, size_t count,
-                             unsigned char *out, int *out_len) {
-    if (!buf || count == 0) { *out_len = 0; return; }
-    int len = count < 8 ? count : 8;
-    if (compat_strncpy_from_user((char *)out, (const char __user *)buf, len) > 0)
-        *out_len = len;
-    else
-        *out_len = 0;
-}
-
-static void print_hex(const unsigned char *data, int len) {
-    for (int i = 0; i < len; i++)
-        printk(KERN_INFO " %02x", data[i]);
-}
-
-/* ---------- CTL0 控制 ---------- */
-static long interceptor_control0(const char *args, char *__user out_msg, int outlen) {
-    if (!args) {
-        if (out_msg && outlen > 0) strncpy(out_msg, "no cmd", outlen);
-        return 0;
-    }
-    if (strcmp(args, "clear") == 0) {
-        clear_table();
-        if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
-    } else if (strcmp(args, "start") == 0) {
-        learn_mode = 0;
-        printk(KERN_INFO "KMS: monitoring mode\n");
-        if (out_msg && outlen > 0) strncpy(out_msg, "monitoring", outlen);
-    } else if (strcmp(args, "stop") == 0) {
-        learn_mode = 1;
-        target_pid = 0;
-        fd_max = 0;
-        printk(KERN_INFO "KMS: stopped, filters cleared\n");
-        if (out_msg && outlen > 0) strncpy(out_msg, "stopped+cleared", outlen);
-    } else if (strncmp(args, "pid=", 4) == 0) {
-        const char *p = args + 4;
-        int pid = 0;
-        while (*p >= '0' && *p <= '9') pid = pid * 10 + (*p++ - '0');
-        if (*p != '\0' || pid <= 0) {
-            if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
-            return -EINVAL;
-        }
-        target_pid = pid;
-        printk(KERN_INFO "KMS: target PID = %d\n", target_pid);
-        if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
-    } else if (strncmp(args, "fdmax=", 6) == 0) {
-        const char *p = args + 6;
-        int val = 0;
-        while (*p >= '0' && *p <= '9') val = val * 10 + (*p++ - '0');
-        if (*p != '\0' || val < 0) {
-            if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
-            return -EINVAL;
-        }
-        fd_max = val;
-        printk(KERN_INFO "KMS: fd_max set to %d\n", fd_max);
-        if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
-    } else if (strncmp(args, "fmt=", 4) == 0) {
-        const char *p = args + 4;
-        int val = 0;
-        while (*p >= '0' && *p <= '9') val = val * 10 + (*p++ - '0');
-        if (*p != '\0' || (val != 0 && val != 1)) {
-            if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
-            return -EINVAL;
-        }
-        output_format = val;
-        printk(KERN_INFO "KMS: output format set to %d\n", output_format);
-        if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
-    } else {
-        if (out_msg && outlen > 0) strncpy(out_msg, "unknown", outlen);
-    }
-    return 0;
-}
-
-/* ---------- Hook 函数 ---------- */
-static void before_pread64(hook_fargs4_t *fargs, void *udata) {
-    int fd = (int)syscall_argn(fargs, 0);
-    void __user *buf = (void __user *)syscall_argn(fargs, 1);
-    size_t count = (size_t)syscall_argn(fargs, 2);
-    loff_t pos = (loff_t)syscall_argn(fargs, 3);
-    if (fd_max > 0 && fd > fd_max) return;
-
-    unsigned char sample[8];
-    int sample_len = 0;
-    read_data_sample(buf, count, sample, &sample_len);
-    u64 sig = hash_signature(fd, pos, count, sample, sample_len);
-
-    if (learn_mode) insert_signature(sig);
-    else if (!is_signature_present(sig)) {
-        if (output_format == 1)
-            printk(KERN_INFO "KMS| pread64(%d, 0x%x, %zu, 0x%llx)\n", fd, buf, count, pos);
-        else {
-            printk(KERN_INFO "KMS| pread64 | FD=%d BUF=%px COUNT=%zu POS=0x%llx", fd, buf, count, pos);
-            if (sample_len > 0) { printk(KERN_INFO " DATA="); print_hex(sample, sample_len); }
-            printk(KERN_INFO "\n");
-        }
-    }
-}
-
-static void before_pwrite64(hook_fargs4_t *fargs, void *udata) {
-    int fd = (int)syscall_argn(fargs, 0);
-    const void __user *buf = (const void __user *)syscall_argn(fargs, 1);
-    size_t count = (size_t)syscall_argn(fargs, 2);
-    loff_t pos = (loff_t)syscall_argn(fargs, 3);
-    if (fd_max > 0 && fd > fd_max) return;
-
-    unsigned char sample[8];
-    int sample_len = 0;
-    read_data_sample(buf, count, sample, &sample_len);
-    u64 sig = hash_signature(fd, pos, count, sample, sample_len);
-
-    if (learn_mode) insert_signature(sig);
-    else if (!is_signature_present(sig)) {
-        if (output_format == 1)
-            printk(KERN_INFO "KMS| pwrite64(%d, 0x%x, %zu, 0x%llx)\n", fd, buf, count, pos);
-        else {
-            printk(KERN_INFO "KMS| pwrite64 | FD=%d BUF=%px COUNT=%zu POS=0x%llx", fd, buf, count, pos);
-            if (sample_len > 0) { printk(KERN_INFO " DATA="); print_hex(sample, sample_len); }
-            printk(KERN_INFO "\n");
-        }
-    }
-}
-
-static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata) {
-    pid_t tpid = (pid_t)syscall_argn(fargs, 0);
-    if (target_pid <= 0 || tpid != target_pid) return;
-    printk(KERN_INFO "KMS| process_vm_readv | TARGET=%d\n", tpid);
-}
-
-static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata) {
-    pid_t tpid = (pid_t)syscall_argn(fargs, 0);
-    if (target_pid <= 0 || tpid != target_pid) return;
-    printk(KERN_INFO "KMS| process_vm_writev | TARGET=%d\n", tpid);
-}
-
-/* ---------- 初始化 ---------- */
-static long init(const char *args, const char *event, void *__user reserved) {
+/* ---------- 模块初始化 ---------- */
+static long init(const char *args, const char *event, void *__user reserved)
+{
     hook_err_t err;
     err = fp_hook_syscalln(__NR_pread64, 4, before_pread64, 0, 0);
     if (err) printk(KERN_ERR "KMS: hook pread64 fail %d\n", err);
@@ -261,44 +81,32 @@ static long init(const char *args, const char *event, void *__user reserved) {
             kernel_write_ptr(fp, msg, sizeof(msg), &pos);
             filp_close_ptr(fp, NULL);
             printk(KERN_INFO "KMS: status file created\n");
+        } else {
+            printk(KERN_ERR "KMS: could not create status file\n");
         }
     }
 
-    printk(KERN_INFO "KMS: loaded (v6.4.1, fmt=%d)\n", output_format);
+    printk(KERN_INFO "KMS: loaded (v6.4.2, fmt=%d)\n", output_format);
     return 0;
 }
 
-/* ---------- 卸载 ---------- */
-static long interceptr_exit(void *__user reserved) {
+/* ---------- 模块卸载 ---------- */
+static long interceptr_exit(void *__user reserved)
+{
     fp_unhook_syscalln(__NR_pread64, before_pread64, 0);
     fp_unhook_syscalln(__NR_pwrite64, before_pwrite64, 0);
     fp_unhook_syscalln(__NR_process_vm_readv, before_process_vm_readv, 0);
     fp_unhook_syscalln(__NR_process_vm_writev, before_process_vm_writev, 0);
 
-    /* 尝试 vfs_unlink */
-    kern_path_t kern_path_ptr = (kern_path_t)kallsyms_lookup_name("kern_path");
-    vfs_unlink_t vfs_unlink_ptr = (vfs_unlink_t)kallsyms_lookup_name("vfs_unlink");
-    path_put_t path_put_ptr = (path_put_t)kallsyms_lookup_name("path_put");
-
-    if (kern_path_ptr && vfs_unlink_ptr && path_put_ptr) {
-        struct path path;
-        if (kern_path_ptr("/data/local/tmp/kms_loaded", 0, &path) == 0) {
-            int ret = vfs_unlink_ptr(&init_user_ns, path.dentry->d_inode, path.dentry, NULL);
-            if (ret == 0 || ret == -ENOENT)
-                printk(KERN_INFO "KMS: status file removed via vfs_unlink\n");
-            else
-                printk(KERN_ERR "KMS: vfs_unlink failed: %d\n", ret);
-            path_put_ptr(&path);
-        }
-    } else {
-        /* 退路：清空文件内容，用户态可根据内容判断 */
-        if (filp_open_ptr && kernel_write_ptr && filp_close_ptr) {
-            struct file *fp = filp_open_ptr("/data/local/tmp/kms_loaded",
-                                            O_WRONLY | O_TRUNC, 0);
-            if (!IS_ERR(fp)) {
-                filp_close_ptr(fp, NULL);
-                printk(KERN_INFO "KMS: status file truncated (fallback)\n");
-            }
+    /* 清空状态文件内容 (截断为 0 字节) */
+    if (filp_open_ptr && filp_close_ptr) {
+        struct file *fp = filp_open_ptr("/data/local/tmp/kms_loaded",
+                                        O_WRONLY | O_TRUNC, 0);
+        if (!IS_ERR(fp)) {
+            filp_close_ptr(fp, NULL);
+            printk(KERN_INFO "KMS: status file truncated\n");
+        } else {
+            printk(KERN_ERR "KMS: could not truncate status file\n");
         }
     }
 

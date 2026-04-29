@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * KernelMemorySky - 完整拦截器 v6.4.3 (文件内容清空 + 所有Hook)
+ * KernelMemorySky - 终极拦截器 v6.5.0
+ * 新增：VM 地址前缀过滤 (vm_lio_ignore / vm_rio_ignore)
  */
 
 #include <compiler.h>
@@ -13,12 +14,12 @@
 #include <asm/current.h>
 
 KPM_NAME("KernelMemorySky");
-KPM_VERSION("6.4.3");
+KPM_VERSION("6.5.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Full interceptor with file truncate on exit");
+KPM_DESCRIPTION("Interceptor with VM address prefix filter");
 
-/* ---------- 补充缺失的宏 ---------- */
+/* ---------- 手动补充缺失的宏和类型 ---------- */
 #ifndef O_CREAT
 #define O_CREAT  0x40
 #endif
@@ -32,6 +33,7 @@ KPM_DESCRIPTION("Full interceptor with file truncate on exit");
 #define IS_ERR(x) ((unsigned long)(void *)(x) >= (unsigned long)(-4095))
 typedef void *fl_owner_t;
 
+/* 文件操作函数指针 */
 typedef struct file *(*filp_open_t)(const char *, int, umode_t);
 typedef ssize_t (*kernel_write_t)(struct file *, const void *, size_t, loff_t *);
 typedef int (*filp_close_t)(struct file *, fl_owner_t);
@@ -43,8 +45,13 @@ static int call_count = 0;
 static int learn_mode = 1;        /* 1=学习, 0=监控 */
 static int output_format = 0;     /* 0=分析模式, 1=原生模式 */
 static int target_pid = 0;
-static int fd_max = 0;
+static int fd_max = 0;            /* 0=不过滤 */
 
+/* ---------- VM 地址前缀过滤 ---------- */
+static uintptr_t vm_lio_ignore = 0;  /* 0=不过滤 */
+static uintptr_t vm_rio_ignore = 0;
+
+/* 文件操作指针 */
 static filp_open_t filp_open_ptr = NULL;
 static kernel_write_t kernel_write_ptr = NULL;
 static filp_close_t filp_close_ptr = NULL;
@@ -95,7 +102,7 @@ static void clear_table(void)
     printk(KERN_INFO "KMS: hash table cleared\n");
 }
 
-/* ---------- 安全读取数据样本 ---------- */
+/* ---------- 安全读取数据样本（最多 8 字节） ---------- */
 static void read_data_sample(const void __user *buf, size_t count,
                              unsigned char *out, int *out_len)
 {
@@ -107,20 +114,21 @@ static void read_data_sample(const void __user *buf, size_t count,
         *out_len = 0;
 }
 
-/* ---------- 十六进制打印 ---------- */
+/* ---------- 辅助：十六进制打印 ---------- */
 static void print_hex(const unsigned char *data, int len)
 {
     for (int i = 0; i < len; i++)
         printk(KERN_INFO " %02x", data[i]);
 }
 
-/* ---------- CTL0 控制 ---------- */
+/* ---------- CTL0 控制命令 ---------- */
 static long interceptor_control0(const char *args, char *__user out_msg, int outlen)
 {
     if (!args) {
         if (out_msg && outlen > 0) strncpy(out_msg, "no cmd", outlen);
         return 0;
     }
+
     if (strcmp(args, "clear") == 0) {
         clear_table();
         if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
@@ -167,6 +175,36 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
         output_format = val;
         printk(KERN_INFO "KMS: output format set to %d\n", output_format);
         if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
+    } else if (strncmp(args, "vm_lio_ignore=", 14) == 0) {
+        const char *p = args + 14;
+        if (*p == '0' && (*(p+1) == 'x' || *(p+1) == 'X')) p += 2;
+        uintptr_t val = 0;
+        while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) {
+            val = (val << 4) + (*p >= 'A' ? ((*p & 0xDF) - 'A' + 10) : (*p - '0'));
+            p++;
+        }
+        if (*p != '\0') {
+            if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
+            return -EINVAL;
+        }
+        vm_lio_ignore = val;
+        printk(KERN_INFO "KMS: vm_lio_ignore set to 0x%llx\n", val);
+        if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
+    } else if (strncmp(args, "vm_rio_ignore=", 14) == 0) {
+        const char *p = args + 14;
+        if (*p == '0' && (*(p+1) == 'x' || *(p+1) == 'X')) p += 2;
+        uintptr_t val = 0;
+        while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F')) {
+            val = (val << 4) + (*p >= 'A' ? ((*p & 0xDF) - 'A' + 10) : (*p - '0'));
+            p++;
+        }
+        if (*p != '\0') {
+            if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
+            return -EINVAL;
+        }
+        vm_rio_ignore = val;
+        printk(KERN_INFO "KMS: vm_rio_ignore set to 0x%llx\n", val);
+        if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
     } else {
         if (out_msg && outlen > 0) strncpy(out_msg, "unknown", outlen);
     }
@@ -193,8 +231,7 @@ static void before_pread64(hook_fargs4_t *fargs, void *udata)
     } else {
         if (!is_signature_present(sig)) {
             if (output_format == 1) {
-                printk(KERN_INFO "KMS| pread64(%d, 0x%x, %zu, 0x%llx)\n",
-                       fd, buf, count, pos);
+                printk(KERN_INFO "KMS| pread64(%d, 0x%x, %zu, 0x%llx)\n", fd, buf, count, pos);
             } else {
                 printk(KERN_INFO "KMS| pread64 | FD=%d BUF=%px COUNT=%zu POS=0x%llx",
                        fd, buf, count, pos);
@@ -228,8 +265,7 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
     } else {
         if (!is_signature_present(sig)) {
             if (output_format == 1) {
-                printk(KERN_INFO "KMS| pwrite64(%d, 0x%x, %zu, 0x%llx)\n",
-                       fd, buf, count, pos);
+                printk(KERN_INFO "KMS| pwrite64(%d, 0x%x, %zu, 0x%llx)\n", fd, buf, count, pos);
             } else {
                 printk(KERN_INFO "KMS| pwrite64 | FD=%d BUF=%px COUNT=%zu POS=0x%llx",
                        fd, buf, count, pos);
@@ -243,7 +279,7 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
     }
 }
 
-/* ---------- process_vm_readv Hook (双模态) ---------- */
+/* ---------- process_vm_readv Hook (双模态 + 地址前缀过滤) ---------- */
 static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
 {
     pid_t tpid = (pid_t)syscall_argn(fargs, 0);
@@ -253,7 +289,13 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
     unsigned long riovcnt = (unsigned long)syscall_argn(fargs, 4);
     unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
 
-    // 模式1：精准PID过滤（用户设置了 target_pid）
+    /* 地址前缀过滤 */
+    if (vm_lio_ignore && (uintptr_t)local_iov >> 32 == vm_lio_ignore >> 32)
+        return;
+    if (vm_rio_ignore && (uintptr_t)remote_iov >> 32 == vm_rio_ignore >> 32)
+        return;
+
+    /* 精准PID过滤 */
     if (target_pid > 0) {
         if (tpid == target_pid) {
             if (output_format == 1) {
@@ -267,8 +309,7 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
         return;
     }
 
-    // 模式2：哈希表模式（未设置 PID）
-    // 构建 VM 专用签名（混合目标 PID、本地/远程 iov 基址和计数）
+    /* 哈希表模式 */
     unsigned char extra_data[16];
     memcpy(extra_data, &liovcnt, sizeof(liovcnt));
     memcpy(extra_data + 8, &riovcnt, sizeof(riovcnt));
@@ -289,7 +330,7 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
     }
 }
 
-/* ---------- process_vm_writev Hook (双模态) ---------- */
+/* ---------- process_vm_writev Hook (双模态 + 地址前缀过滤) ---------- */
 static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
 {
     pid_t tpid = (pid_t)syscall_argn(fargs, 0);
@@ -299,7 +340,13 @@ static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
     unsigned long riovcnt = (unsigned long)syscall_argn(fargs, 4);
     unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
 
-    // 模式1：精准PID过滤
+    /* 地址前缀过滤 */
+    if (vm_lio_ignore && (uintptr_t)local_iov >> 32 == vm_lio_ignore >> 32)
+        return;
+    if (vm_rio_ignore && (uintptr_t)remote_iov >> 32 == vm_rio_ignore >> 32)
+        return;
+
+    /* 精准PID过滤 */
     if (target_pid > 0) {
         if (tpid == target_pid) {
             if (output_format == 1) {
@@ -313,7 +360,7 @@ static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
         return;
     }
 
-    // 模式2：哈希表模式
+    /* 哈希表模式 */
     unsigned char extra_data[16];
     memcpy(extra_data, &liovcnt, sizeof(liovcnt));
     memcpy(extra_data + 8, &riovcnt, sizeof(riovcnt));
@@ -334,7 +381,7 @@ static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
     }
 }
 
-/* ---------- 初始化 ---------- */
+/* ---------- 模块初始化 ---------- */
 static long init(const char *args, const char *event, void *__user reserved)
 {
     hook_err_t err;
@@ -352,7 +399,7 @@ static long init(const char *args, const char *event, void *__user reserved)
     kernel_write_ptr = (kernel_write_t)kallsyms_lookup_name("kernel_write");
     filp_close_ptr = (filp_close_t)kallsyms_lookup_name("filp_close");
 
-    /* 创建状态文件 */
+    /* 创建状态标记文件 */
     if (filp_open_ptr && kernel_write_ptr && filp_close_ptr) {
         struct file *fp = filp_open_ptr("/data/local/tmp/kms_loaded",
                                         O_CREAT | O_WRONLY | O_TRUNC, 0644);
@@ -365,11 +412,11 @@ static long init(const char *args, const char *event, void *__user reserved)
         }
     }
 
-    printk(KERN_INFO "KMS: loaded (v6.4.3, fmt=%d)\n", output_format);
+    printk(KERN_INFO "KMS: loaded (v6.5.0, fmt=%d)\n", output_format);
     return 0;
 }
 
-/* ---------- 卸载 ---------- */
+/* ---------- 模块卸载 ---------- */
 static long interceptr_exit(void *__user reserved)
 {
     fp_unhook_syscalln(__NR_pread64, before_pread64, 0);
@@ -377,7 +424,7 @@ static long interceptr_exit(void *__user reserved)
     fp_unhook_syscalln(__NR_process_vm_readv, before_process_vm_readv, 0);
     fp_unhook_syscalln(__NR_process_vm_writev, before_process_vm_writev, 0);
 
-    /* 清空状态文件内容（截断） */
+    /* 清空状态文件内容（截断为 0 字节） */
     if (filp_open_ptr && filp_close_ptr) {
         struct file *fp = filp_open_ptr("/data/local/tmp/kms_loaded",
                                         O_WRONLY | O_TRUNC, 0);

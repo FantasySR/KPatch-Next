@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * KernelMemorySky - 终极拦截器 v6.5.2
- * 自动过滤进程内 VM 调用，所有命令见模块描述
+ * KernelMemorySky - 终极拦截器 v6.5.3
+ * 可配置进程内 VM 调用过滤，全部命令见简介
  */
 
 #include <compiler.h>
@@ -14,10 +14,10 @@
 #include <asm/current.h>
 
 KPM_NAME("KernelMemorySky");
-KPM_VERSION("6.5.2");
+KPM_VERSION("6.5.3");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("clear|start|stop|pid=N|fdmax=N|fmt=0/1|off");
+KPM_DESCRIPTION("clear|start|stop|pid=N|fdmax=N|fmt=0/1|vm_no_local=0/1");
 
 /* ---------- 手动补充缺失的宏和类型 ---------- */
 #ifndef O_CREAT
@@ -45,7 +45,8 @@ static int call_count = 0;
 static int learn_mode = 1;        /* 1=学习, 0=监控 */
 static int output_format = 0;     /* 0=分析模式, 1=原生模式 */
 static int target_pid = 0;
-static int fd_max = 0;
+static int fd_max = 0;            /* 0=不过滤 */
+static int vm_no_local = 0;       /* 0=不过滤进程内VM调用, 1=过滤 */
 
 static filp_open_t filp_open_ptr = NULL;
 static kernel_write_t kernel_write_ptr = NULL;
@@ -135,6 +136,7 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
         learn_mode = 1;
         target_pid = 0;
         fd_max = 0;
+        vm_no_local = 0;          // 同时关闭进程内过滤
         printk(KERN_INFO "KMS: stopped, filters cleared\n");
         if (out_msg && outlen > 0) strncpy(out_msg, "stopped+cleared", outlen);
     } else if (strncmp(args, "pid=", 4) == 0) {
@@ -169,6 +171,17 @@ static long interceptor_control0(const char *args, char *__user out_msg, int out
         }
         output_format = val;
         printk(KERN_INFO "KMS: output format set to %d\n", output_format);
+        if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
+    } else if (strncmp(args, "vm_no_local=", 12) == 0) {
+        const char *p = args + 12;
+        int val = 0;
+        while (*p >= '0' && *p <= '9') val = val * 10 + (*p++ - '0');
+        if (*p != '\0' || (val != 0 && val != 1)) {
+            if (out_msg && outlen > 0) strncpy(out_msg, "err", outlen);
+            return -EINVAL;
+        }
+        vm_no_local = val;
+        printk(KERN_INFO "KMS: vm_no_local set to %d\n", vm_no_local);
         if (out_msg && outlen > 0) strncpy(out_msg, "ok", outlen);
     } else {
         if (out_msg && outlen > 0) strncpy(out_msg, "unknown", outlen);
@@ -244,7 +257,7 @@ static void before_pwrite64(hook_fargs4_t *fargs, void *udata)
     }
 }
 
-/* ---------- process_vm_readv Hook (自动过滤进程内调用) ---------- */
+/* ---------- process_vm_readv Hook ---------- */
 static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
 {
     pid_t tpid = (pid_t)syscall_argn(fargs, 0);
@@ -254,8 +267,8 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
     unsigned long riovcnt = (unsigned long)syscall_argn(fargs, 4);
     unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
 
-    // 自动过滤进程内调用：本地和远程地址高32位相同
-    if ((uintptr_t)local_iov >> 32 == (uintptr_t)remote_iov >> 32) return;
+    // 可配置进程内调用过滤
+    if (vm_no_local && (uintptr_t)local_iov >> 32 == (uintptr_t)remote_iov >> 32) return;
 
     if (target_pid > 0) {
         if (tpid == target_pid) {
@@ -290,7 +303,7 @@ static void before_process_vm_readv(hook_fargs6_t *fargs, void *udata)
     }
 }
 
-/* ---------- process_vm_writev Hook (自动过滤进程内调用) ---------- */
+/* ---------- process_vm_writev Hook ---------- */
 static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
 {
     pid_t tpid = (pid_t)syscall_argn(fargs, 0);
@@ -300,8 +313,8 @@ static void before_process_vm_writev(hook_fargs6_t *fargs, void *udata)
     unsigned long riovcnt = (unsigned long)syscall_argn(fargs, 4);
     unsigned long flags = (unsigned long)syscall_argn(fargs, 5);
 
-    // 自动过滤进程内调用
-    if ((uintptr_t)local_iov >> 32 == (uintptr_t)remote_iov >> 32) return;
+    // 可配置进程内调用过滤
+    if (vm_no_local && (uintptr_t)local_iov >> 32 == (uintptr_t)remote_iov >> 32) return;
 
     if (target_pid > 0) {
         if (tpid == target_pid) {
@@ -365,7 +378,7 @@ static long init(const char *args, const char *event, void *__user reserved)
         }
     }
 
-    printk(KERN_INFO "KMS: loaded (v6.5.2, fmt=%d)\n", output_format);
+    printk(KERN_INFO "KMS: loaded (v6.5.3, fmt=%d)\n", output_format);
     return 0;
 }
 

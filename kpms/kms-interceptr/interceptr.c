@@ -17,7 +17,8 @@ KPM_NAME("KernelMemorySky");
 KPM_VERSION("6.5.6");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("内核级hook进程读写，默认学习模式，将会记录重复的调用，输入参数start后将开启监控模式，输出p read/write 64和process_vm_ read/write v的输出\nstart：监控模式\nstop：学习模式\nclear：清空学习记录\nfdmax=N：对prw的fd限制进行过滤，一般设置10就可以\nfmt=0/1：输出格式，分析模式/原生模式\nvm_lio_mark=XX：高位地址过滤，部分程序会自己读写自己，地址可能为b4，输入nvm_lio_mark=b4将过滤该条\npid=N：内核层vmrw读写pid过滤");
+KPM_DESCRIPTION("内核级hook进程读写，无法被拦截
+\nstart | stop | clear\nfdmax=N：对prw的fd限制进行过滤\nfmt=0/1：输出格式，分析模式/原生模式\nvm_lio_mark=XX：高位地址过滤(b4)");
 
 /* ---------- 手动补充缺失的宏和类型 ---------- */
 #ifndef O_CREAT

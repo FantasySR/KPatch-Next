@@ -1,7 +1,15 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * KernelMemorySky - 终极拦截器 v6.5.5
- * 内核态精准过滤游戏自身 VM 调用
+ * KernelMemorySky - 终极拦截器 v6.5.6
+ * 默认为学习模式，将会记录重复系统多余进程调用，此步过滤大多数多余调用
+ * start 进入监控模式，输出未在学习列表内的调用
+ * stop 进入学习模式，重新记录重复调用到学习表
+ * clear 清除学习表内容
+ * fdmax=N 通过设置最大fd值过滤，设置为10则10以上的fd值都被过滤，一般进程读写都不超过5
+ * fmt=0/1 格式输出模式，0默认
+ *    0: 分析输出模式，将把信息单独分析后输出
+ *    1: 原始调用模式，将直接输出代码内原始调用的格式
+ * vm_lio_mark=XX 高位地址过滤器，目标程序可能自己读写自己，一般是vmrw，自己读写自己时，高位不为0，可能为b4，此时输入b4将过滤这步
  */
 
 #include <compiler.h>
@@ -371,7 +379,7 @@ static long init(const char *args, const char *event, void *__user reserved)
     filp_close_ptr = (filp_close_t)kallsyms_lookup_name("filp_close");
 
     if (filp_open_ptr && kernel_write_ptr && filp_close_ptr) {
-        struct file *fp = filp_open_ptr("/data/local/tmp/kms_loaded",
+        struct file *fp = filp_open_ptr("/data/adb/kpm/khook_loaded",
                                         O_CREAT | O_WRONLY | O_TRUNC, 0644);
         if (!IS_ERR(fp)) {
             char msg[] = "loaded";
@@ -395,7 +403,7 @@ static long interceptr_exit(void *__user reserved)
     fp_unhook_syscalln(__NR_process_vm_writev, before_process_vm_writev, 0);
 
     if (filp_open_ptr && filp_close_ptr) {
-        struct file *fp = filp_open_ptr("/data/local/tmp/kms_loaded",
+        struct file *fp = filp_open_ptr("/data/adb/kpm/khook_loaded",
                                         O_WRONLY | O_TRUNC, 0);
         if (!IS_ERR(fp)) {
             filp_close_ptr(fp, NULL);

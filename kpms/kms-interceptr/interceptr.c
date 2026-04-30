@@ -17,9 +17,7 @@ KPM_NAME("KernelMemorySky");
 KPM_VERSION("6.5.6");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION('
-kernel hook process r/w
-start | stop | clear\nfdmax=N：对prw的fd值进行过滤\nfmt=0/1：mode Analyse/Native\nvm_lio_mark=XX：高位地址过滤(b4)');
+KPM_DESCRIPTION(kernel hook process r/w - start | stop | clear - fdmax=N: Filter fd for prw - fmt=0/1: output_mode Analyse/Native - vm_lio_mark=XX: High address filtering(b4)');
 
 /* ---------- 手动补充缺失的宏和类型 ---------- */
 #ifndef O_CREAT

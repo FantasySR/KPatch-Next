@@ -13,7 +13,7 @@
 #include <kputils.h>
 #include <asm/current.h>
 
-KPM_NAME("KernelMemorySky");
+KPM_NAME("khook - r/w");
 KPM_VERSION("6.5.6");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");

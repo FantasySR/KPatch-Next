@@ -61,6 +61,10 @@ jobs:
           make
           mv inlinehook.kpm demo-inlinehook.kpm
 
+          cd ../demo-netlink
+          make
+          mv netlink.kpm demo-netlink.kpm
+
           cd ../demo-parameter
           make
           mv parameter.kpm demo-parameter.kpm
@@ -90,6 +94,7 @@ jobs:
             kpms/demo-device/demo-device.kpm
             kpms/demo-hello/demo-hello.kpm
             kpms/demo-inlinehook/demo-inlinehook.kpm
+            kpms/demo-netlink/demo-netlink.kpm
             kpms/demo-parameter/demo-parameter.kpm
             kpms/demo-syscallhook/demo-syscallhook.kpm
             kpms/kms-interceptr/release-interceptr.kpm

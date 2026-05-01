@@ -5,10 +5,10 @@
 #include <syscall.h>
 
 KPM_NAME("KMS_NetMonitor");
-KPM_VERSION("1.0.5");
+KPM_VERSION("1.0.6");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Minimal trace from syscallhook template");
+KPM_DESCRIPTION("Network syscall hooks with hardcoded numbers");
 
 static int monitor_running = 0;
 
@@ -37,24 +37,25 @@ static long control0(const char *args, char *__user out_msg, int outlen) {
 
 static long init(const char *args, const char *event, void *__user reserved) {
     hook_err_t err;
-    err = fp_hook_syscalln(__NR_connect, 3, before_connect, 0, 0);
+    // ARM64 syscall numbers: connect=203, sendto=206, sendmsg=211
+    err = fp_hook_syscalln(203, 3, before_connect, 0, 0);
     if (err) printk(KERN_ERR "KMS_NET: hook connect fail %d\n", err);
-    err = fp_hook_syscalln(__NR_sendto, 6, before_sendto, 0, 0);
+    err = fp_hook_syscalln(206, 6, before_sendto, 0, 0);
     if (err) printk(KERN_ERR "KMS_NET: hook sendto fail %d\n", err);
-    err = fp_hook_syscalln(__NR_sendmsg, 3, before_sendmsg, 0, 0);
+    err = fp_hook_syscalln(211, 3, before_sendmsg, 0, 0);
     if (err) printk(KERN_ERR "KMS_NET: hook sendmsg fail %d\n", err);
     printk(KERN_INFO "KMS_NET: hooks installed\n");
     return 0;
 }
 
-static long exit(void *__user reserved) {
-    fp_unhook_syscalln(__NR_connect, before_connect, 0);
-    fp_unhook_syscalln(__NR_sendto, before_sendto, 0);
-    fp_unhook_syscalln(__NR_sendmsg, before_sendmsg, 0);
+static long netmon_exit(void *__user reserved) {
+    fp_unhook_syscalln(203, before_connect, 0);
+    fp_unhook_syscalln(206, before_sendto, 0);
+    fp_unhook_syscalln(211, before_sendmsg, 0);
     printk(KERN_INFO "KMS_NET: unloaded\n");
     return 0;
 }
 
 KPM_INIT(init);
-KPM_EXIT(exit);
+KPM_EXIT(netmon_exit);
 KPM_CTL0(control0);

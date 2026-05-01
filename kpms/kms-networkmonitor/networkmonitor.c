@@ -5,25 +5,19 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <syscall.h>
-#include <asm/current.h>
 
 KPM_NAME("KMS_NetMonitor");
-KPM_VERSION("1.0.2");
+KPM_VERSION("1.0.3");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Network syscall hooks with full definitions");
+KPM_DESCRIPTION("Network syscall hooks (no pid)");
 
-/* ---- 补充所有网络结构体定义 ---- */
+/* ---- 补充网络结构体 ---- */
 #define AF_INET  2
 #define ntohs(x) __builtin_bswap16(x)
 
 struct in_addr {
     __u32 s_addr;
-};
-
-struct sockaddr {
-    unsigned short sa_family;
-    char sa_data[14];
 };
 
 struct sockaddr_in {
@@ -67,7 +61,7 @@ static int monitor_running = 0;
 static void before_connect(hook_fargs3_t *fargs, void *udata) {
     if (!monitor_running) return;
     int fd = (int)syscall_argn(fargs, 0);
-    struct sockaddr __user *usa = (struct sockaddr __user *)syscall_argn(fargs, 1);
+    struct sockaddr_in __user *usa = (struct sockaddr_in __user *)syscall_argn(fargs, 1);
     if (!usa) return;
 
     struct sockaddr_in sin;
@@ -77,8 +71,8 @@ static void before_connect(hook_fargs3_t *fargs, void *udata) {
 
     char ip[16];
     ip_to_str(sin.sin_addr.s_addr, ip);
-    printk(KERN_INFO "KMS_NET| CONNECT | fd=%d -> %s:%d | pid=%d\n",
-           fd, ip, ntohs(sin.sin_port), current->pid);
+    printk(KERN_INFO "KMS_NET| CONNECT | fd=%d -> %s:%d\n",
+           fd, ip, ntohs(sin.sin_port));
 }
 
 /* ---- Hook: sendto ---- */
@@ -86,7 +80,7 @@ static void before_sendto(hook_fargs6_t *fargs, void *udata) {
     if (!monitor_running) return;
     int fd = (int)syscall_argn(fargs, 0);
     size_t len = (size_t)syscall_argn(fargs, 2);
-    struct sockaddr __user *usa = (struct sockaddr __user *)syscall_argn(fargs, 4);
+    struct sockaddr_in __user *usa = (struct sockaddr_in __user *)syscall_argn(fargs, 4);
     if (!usa) return;
 
     struct sockaddr_in sin;
@@ -96,8 +90,8 @@ static void before_sendto(hook_fargs6_t *fargs, void *udata) {
 
     char ip[16];
     ip_to_str(sin.sin_addr.s_addr, ip);
-    printk(KERN_INFO "KMS_NET| SENDTO | fd=%d -> %s:%d size=%zu | pid=%d\n",
-           fd, ip, ntohs(sin.sin_port), len, current->pid);
+    printk(KERN_INFO "KMS_NET| SENDTO | fd=%d -> %s:%d size=%zu\n",
+           fd, ip, ntohs(sin.sin_port), len);
 }
 
 /* ---- Hook: sendmsg ---- */
@@ -119,8 +113,8 @@ static void before_sendmsg(hook_fargs3_t *fargs, void *udata) {
 
     char ip[16];
     ip_to_str(sin.sin_addr.s_addr, ip);
-    printk(KERN_INFO "KMS_NET| SENDMSG | fd=%d -> %s:%d size=%zu | pid=%d\n",
-           fd, ip, ntohs(sin.sin_port), msg.msg_iovlen, current->pid);
+    printk(KERN_INFO "KMS_NET| SENDMSG | fd=%d -> %s:%d size=%zu\n",
+           fd, ip, ntohs(sin.sin_port), msg.msg_iovlen);
 }
 
 /* ---- CTL0 控制 ---- */

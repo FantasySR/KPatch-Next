@@ -5,10 +5,10 @@
 #include <syscall.h>
 
 KPM_NAME("KMS_NetMonitor");
-KPM_VERSION("1.0.4");
+KPM_VERSION("1.0.5");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Minimal syscall trace for network");
+KPM_DESCRIPTION("Minimal trace from syscallhook template");
 
 static int monitor_running = 0;
 
@@ -27,7 +27,7 @@ static void before_sendmsg(hook_fargs3_t *fargs, void *udata) {
     printk(KERN_INFO "KMS_NET| SENDMSG called\n");
 }
 
-static long netmon_control0(const char *args, char *__user out_msg, int outlen) {
+static long control0(const char *args, char *__user out_msg, int outlen) {
     if (!args) { if (out_msg) strncpy(out_msg, "no cmd", outlen); return 0; }
     if (strcmp(args, "run") == 0) { monitor_running=1; printk(KERN_INFO "KMS_NET: running\n"); if (out_msg) strncpy(out_msg, "running", outlen); }
     else if (strcmp(args, "stop") == 0) { monitor_running=0; printk(KERN_INFO "KMS_NET: stopped\n"); if (out_msg) strncpy(out_msg, "stopped", outlen); }
@@ -47,7 +47,7 @@ static long init(const char *args, const char *event, void *__user reserved) {
     return 0;
 }
 
-static long netmon_exit(void *__user reserved) {
+static long exit(void *__user reserved) {
     fp_unhook_syscalln(__NR_connect, before_connect, 0);
     fp_unhook_syscalln(__NR_sendto, before_sendto, 0);
     fp_unhook_syscalln(__NR_sendmsg, before_sendmsg, 0);
@@ -56,5 +56,5 @@ static long netmon_exit(void *__user reserved) {
 }
 
 KPM_INIT(init);
-KPM_EXIT(netmon_exit);
-KPM_CTL0(netmon_control0);
+KPM_EXIT(exit);
+KPM_CTL0(control0);

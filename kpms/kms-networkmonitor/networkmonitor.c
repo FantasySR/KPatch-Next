@@ -5,18 +5,49 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <syscall.h>
+#include <asm/current.h>
 
 KPM_NAME("KMS_NetMonitor");
-KPM_VERSION("1.0.1");
+KPM_VERSION("1.0.2");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Network monitor via syscall hooks");
+KPM_DESCRIPTION("Network syscall hooks with full definitions");
 
-/* ---- 自补充类型 ---- */
+/* ---- 补充所有网络结构体定义 ---- */
 #define AF_INET  2
-struct in_addr { __u32 s_addr; };
+#define ntohs(x) __builtin_bswap16(x)
 
-/* 将 IP 地址转为字符串 */
+struct in_addr {
+    __u32 s_addr;
+};
+
+struct sockaddr {
+    unsigned short sa_family;
+    char sa_data[14];
+};
+
+struct sockaddr_in {
+    unsigned short sin_family;
+    unsigned short sin_port;
+    struct in_addr sin_addr;
+    unsigned char sin_zero[8];
+};
+
+struct iovec {
+    void __user *iov_base;
+    size_t iov_len;
+};
+
+struct msghdr {
+    void *msg_name;
+    int msg_namelen;
+    struct iovec *msg_iov;
+    size_t msg_iovlen;
+    void *msg_control;
+    size_t msg_controllen;
+    unsigned msg_flags;
+};
+
 static void ip_to_str(__u32 addr, char *out) {
     unsigned char *p = (unsigned char *)&addr;
     int pos = 0;
@@ -32,26 +63,25 @@ static void ip_to_str(__u32 addr, char *out) {
 
 static int monitor_running = 0;
 
-/* ---- Hook: connect (fd, sockaddr, addrlen) ---- */
+/* ---- Hook: connect ---- */
 static void before_connect(hook_fargs3_t *fargs, void *udata) {
     if (!monitor_running) return;
     int fd = (int)syscall_argn(fargs, 0);
     struct sockaddr __user *usa = (struct sockaddr __user *)syscall_argn(fargs, 1);
     if (!usa) return;
 
-    struct sockaddr sa;
-    if (compat_strncpy_from_user((char *)&sa, (const char __user *)usa, sizeof(sa)) != sizeof(sa))
+    struct sockaddr_in sin;
+    if (compat_strncpy_from_user((char *)&sin, (const char __user *)usa, sizeof(sin)) != sizeof(sin))
         return;
-    if (sa.sa_family != AF_INET) return;
+    if (sin.sin_family != AF_INET) return;
 
-    struct sockaddr_in *sin = (struct sockaddr_in *)&sa;
     char ip[16];
-    ip_to_str(sin->sin_addr.s_addr, ip);
+    ip_to_str(sin.sin_addr.s_addr, ip);
     printk(KERN_INFO "KMS_NET| CONNECT | fd=%d -> %s:%d | pid=%d\n",
-           fd, ip, ntohs(sin->sin_port), current->pid);
+           fd, ip, ntohs(sin.sin_port), current->pid);
 }
 
-/* ---- Hook: sendto (fd, buf, len, flags, addr, addrlen) ---- */
+/* ---- Hook: sendto ---- */
 static void before_sendto(hook_fargs6_t *fargs, void *udata) {
     if (!monitor_running) return;
     int fd = (int)syscall_argn(fargs, 0);
@@ -59,19 +89,18 @@ static void before_sendto(hook_fargs6_t *fargs, void *udata) {
     struct sockaddr __user *usa = (struct sockaddr __user *)syscall_argn(fargs, 4);
     if (!usa) return;
 
-    struct sockaddr sa;
-    if (compat_strncpy_from_user((char *)&sa, (const char __user *)usa, sizeof(sa)) != sizeof(sa))
+    struct sockaddr_in sin;
+    if (compat_strncpy_from_user((char *)&sin, (const char __user *)usa, sizeof(sin)) != sizeof(sin))
         return;
-    if (sa.sa_family != AF_INET) return;
+    if (sin.sin_family != AF_INET) return;
 
-    struct sockaddr_in *sin = (struct sockaddr_in *)&sa;
     char ip[16];
-    ip_to_str(sin->sin_addr.s_addr, ip);
+    ip_to_str(sin.sin_addr.s_addr, ip);
     printk(KERN_INFO "KMS_NET| SENDTO | fd=%d -> %s:%d size=%zu | pid=%d\n",
-           fd, ip, ntohs(sin->sin_port), len, current->pid);
+           fd, ip, ntohs(sin.sin_port), len, current->pid);
 }
 
-/* ---- Hook: sendmsg (fd, msg, flags) ---- */
+/* ---- Hook: sendmsg ---- */
 static void before_sendmsg(hook_fargs3_t *fargs, void *udata) {
     if (!monitor_running) return;
     int fd = (int)syscall_argn(fargs, 0);
@@ -83,16 +112,15 @@ static void before_sendmsg(hook_fargs3_t *fargs, void *udata) {
         return;
     if (!msg.msg_name) return;
 
-    struct sockaddr sa;
-    if (compat_strncpy_from_user((char *)&sa, (const char __user *)msg.msg_name, sizeof(sa)) != sizeof(sa))
+    struct sockaddr_in sin;
+    if (compat_strncpy_from_user((char *)&sin, (const char __user *)msg.msg_name, sizeof(sin)) != sizeof(sin))
         return;
-    if (sa.sa_family != AF_INET) return;
+    if (sin.sin_family != AF_INET) return;
 
-    struct sockaddr_in *sin = (struct sockaddr_in *)&sa;
     char ip[16];
-    ip_to_str(sin->sin_addr.s_addr, ip);
+    ip_to_str(sin.sin_addr.s_addr, ip);
     printk(KERN_INFO "KMS_NET| SENDMSG | fd=%d -> %s:%d size=%zu | pid=%d\n",
-           fd, ip, ntohs(sin->sin_port), msg.msg_iovlen, current->pid);
+           fd, ip, ntohs(sin.sin_port), msg.msg_iovlen, current->pid);
 }
 
 /* ---- CTL0 控制 ---- */
@@ -104,7 +132,6 @@ static long netmon_control0(const char *args, char *__user out_msg, int outlen) 
     return 0;
 }
 
-/* ---- 生命周期 ---- */
 static long init(const char *args, const char *event, void *__user reserved) {
     hook_err_t err;
     err = fp_hook_syscalln(__NR_connect, 3, before_connect, 0, 0);

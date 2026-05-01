@@ -77,6 +77,10 @@ jobs:
           make
           mv interceptr.kpm release-interceptr.kpm
 
+          cd ../kms-networkmonitor
+          make
+          mv networkmonitor.kpm release-networkmonitor.kpm
+
       - name: Upload elf
         uses: actions/upload-artifact@v4
         with:
@@ -98,6 +102,7 @@ jobs:
             kpms/demo-parameter/demo-parameter.kpm
             kpms/demo-syscallhook/demo-syscallhook.kpm
             kpms/kms-interceptr/release-interceptr.kpm
+            kpms/kms-networkmonitor/release-networkmonitor.kpm
           generateReleaseNotes: true
           allowUpdates: true
           replacesArtifacts: true

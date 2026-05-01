@@ -4,36 +4,19 @@
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+#include <syscall.h>
 
 KPM_NAME("KMS_NetMonitor");
-KPM_VERSION("1.0.0");
+KPM_VERSION("1.0.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Kernel network monitor");
+KPM_DESCRIPTION("Network monitor via syscall hooks");
 
 /* ---- 自补充类型 ---- */
 #define AF_INET  2
-#define AF_INET6 10
-
 struct in_addr { __u32 s_addr; };
-struct sock {
-    unsigned short  sk_family;
-    unsigned short  sk_num;
-    __u32           sk_daddr;
-    __u32           sk_rcv_saddr;
-    unsigned short  sk_dport;
-};
-struct msghdr {
-    void *msg_name; int msg_namelen;
-    struct iovec *msg_iov; size_t msg_iovlen;
-    void *msg_control; size_t msg_controllen;
-    unsigned msg_flags;
-};
-struct iovec { void __user *iov_base; size_t iov_len; };
 
-#define ntohs(x) (x)
-
-/* 用最原始的方式拼 IP 字符串 */
+/* 将 IP 地址转为字符串 */
 static void ip_to_str(__u32 addr, char *out) {
     unsigned char *p = (unsigned char *)&addr;
     int pos = 0;
@@ -49,34 +32,70 @@ static void ip_to_str(__u32 addr, char *out) {
 
 static int monitor_running = 0;
 
-typedef int (*sendmsg_t)(struct sock *, struct msghdr *, size_t);
-static sendmsg_t orig_tcp_sendmsg = NULL;
-static sendmsg_t orig_udp_sendmsg = NULL;
+/* ---- Hook: connect (fd, sockaddr, addrlen) ---- */
+static void before_connect(hook_fargs3_t *fargs, void *udata) {
+    if (!monitor_running) return;
+    int fd = (int)syscall_argn(fargs, 0);
+    struct sockaddr __user *usa = (struct sockaddr __user *)syscall_argn(fargs, 1);
+    if (!usa) return;
 
-static int hook_tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size) {
-    if (monitor_running && sk) {
-        char src[16], dst[16];
-        ip_to_str(sk->sk_rcv_saddr, src);
-        ip_to_str(sk->sk_daddr, dst);
-        printk(KERN_INFO "KMS_NET| TCP | %s:%d -> %s:%d | %zu bytes\n",
-               src, sk->sk_num, dst, ntohs(sk->sk_dport), size);
-    }
-    if (orig_tcp_sendmsg) return orig_tcp_sendmsg(sk, msg, size);
-    return 0;
+    struct sockaddr sa;
+    if (compat_strncpy_from_user((char *)&sa, (const char __user *)usa, sizeof(sa)) != sizeof(sa))
+        return;
+    if (sa.sa_family != AF_INET) return;
+
+    struct sockaddr_in *sin = (struct sockaddr_in *)&sa;
+    char ip[16];
+    ip_to_str(sin->sin_addr.s_addr, ip);
+    printk(KERN_INFO "KMS_NET| CONNECT | fd=%d -> %s:%d | pid=%d\n",
+           fd, ip, ntohs(sin->sin_port), current->pid);
 }
 
-static int hook_udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size) {
-    if (monitor_running && sk) {
-        char src[16], dst[16];
-        ip_to_str(sk->sk_rcv_saddr, src);
-        ip_to_str(sk->sk_daddr, dst);
-        printk(KERN_INFO "KMS_NET| UDP | %s:%d -> %s:%d | %zu bytes\n",
-               src, sk->sk_num, dst, ntohs(sk->sk_dport), size);
-    }
-    if (orig_udp_sendmsg) return orig_udp_sendmsg(sk, msg, size);
-    return 0;
+/* ---- Hook: sendto (fd, buf, len, flags, addr, addrlen) ---- */
+static void before_sendto(hook_fargs6_t *fargs, void *udata) {
+    if (!monitor_running) return;
+    int fd = (int)syscall_argn(fargs, 0);
+    size_t len = (size_t)syscall_argn(fargs, 2);
+    struct sockaddr __user *usa = (struct sockaddr __user *)syscall_argn(fargs, 4);
+    if (!usa) return;
+
+    struct sockaddr sa;
+    if (compat_strncpy_from_user((char *)&sa, (const char __user *)usa, sizeof(sa)) != sizeof(sa))
+        return;
+    if (sa.sa_family != AF_INET) return;
+
+    struct sockaddr_in *sin = (struct sockaddr_in *)&sa;
+    char ip[16];
+    ip_to_str(sin->sin_addr.s_addr, ip);
+    printk(KERN_INFO "KMS_NET| SENDTO | fd=%d -> %s:%d size=%zu | pid=%d\n",
+           fd, ip, ntohs(sin->sin_port), len, current->pid);
 }
 
+/* ---- Hook: sendmsg (fd, msg, flags) ---- */
+static void before_sendmsg(hook_fargs3_t *fargs, void *udata) {
+    if (!monitor_running) return;
+    int fd = (int)syscall_argn(fargs, 0);
+    struct msghdr __user *umsg = (struct msghdr __user *)syscall_argn(fargs, 1);
+    if (!umsg) return;
+
+    struct msghdr msg;
+    if (compat_strncpy_from_user((char *)&msg, (const char __user *)umsg, sizeof(msg)) != sizeof(msg))
+        return;
+    if (!msg.msg_name) return;
+
+    struct sockaddr sa;
+    if (compat_strncpy_from_user((char *)&sa, (const char __user *)msg.msg_name, sizeof(sa)) != sizeof(sa))
+        return;
+    if (sa.sa_family != AF_INET) return;
+
+    struct sockaddr_in *sin = (struct sockaddr_in *)&sa;
+    char ip[16];
+    ip_to_str(sin->sin_addr.s_addr, ip);
+    printk(KERN_INFO "KMS_NET| SENDMSG | fd=%d -> %s:%d size=%zu | pid=%d\n",
+           fd, ip, ntohs(sin->sin_port), msg.msg_iovlen, current->pid);
+}
+
+/* ---- CTL0 控制 ---- */
 static long netmon_control0(const char *args, char *__user out_msg, int outlen) {
     if (!args) { if (out_msg) strncpy(out_msg, "no cmd", outlen); return 0; }
     if (strcmp(args, "run") == 0) { monitor_running=1; printk(KERN_INFO "KMS_NET: running\n"); if (out_msg) strncpy(out_msg, "running", outlen); }
@@ -85,17 +104,26 @@ static long netmon_control0(const char *args, char *__user out_msg, int outlen) 
     return 0;
 }
 
+/* ---- 生命周期 ---- */
 static long init(const char *args, const char *event, void *__user reserved) {
-    unsigned long tcp = kallsyms_lookup_name("tcp_sendmsg");
-    unsigned long udp = kallsyms_lookup_name("udp_sendmsg");
-    if (!tcp || !udp) { printk(KERN_ERR "KMS_NET: symbols missing\n"); return -1; }
-    orig_tcp_sendmsg = (sendmsg_t)tcp;
-    orig_udp_sendmsg = (sendmsg_t)udp;
-    printk(KERN_INFO "KMS_NET: ready (tcp=%lx, udp=%lx)\n", tcp, udp);
+    hook_err_t err;
+    err = fp_hook_syscalln(__NR_connect, 3, before_connect, 0, 0);
+    if (err) printk(KERN_ERR "KMS_NET: hook connect fail %d\n", err);
+    err = fp_hook_syscalln(__NR_sendto, 6, before_sendto, 0, 0);
+    if (err) printk(KERN_ERR "KMS_NET: hook sendto fail %d\n", err);
+    err = fp_hook_syscalln(__NR_sendmsg, 3, before_sendmsg, 0, 0);
+    if (err) printk(KERN_ERR "KMS_NET: hook sendmsg fail %d\n", err);
+    printk(KERN_INFO "KMS_NET: hooks installed\n");
     return 0;
 }
 
-static long netmon_exit(void *__user reserved) { printk(KERN_INFO "KMS_NET: unloaded\n"); return 0; }
+static long netmon_exit(void *__user reserved) {
+    fp_unhook_syscalln(__NR_connect, before_connect, 0);
+    fp_unhook_syscalln(__NR_sendto, before_sendto, 0);
+    fp_unhook_syscalln(__NR_sendmsg, before_sendmsg, 0);
+    printk(KERN_INFO "KMS_NET: unloaded\n");
+    return 0;
+}
 
 KPM_INIT(init);
 KPM_EXIT(netmon_exit);

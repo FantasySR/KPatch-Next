@@ -2,122 +2,31 @@
 #include <compiler.h>
 #include <kpmodule.h>
 #include <linux/printk.h>
-#include <linux/string.h>
-#include <linux/uaccess.h>
 #include <syscall.h>
 
 KPM_NAME("KMS_NetMonitor");
-KPM_VERSION("1.0.3");
+KPM_VERSION("1.0.4");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Network syscall hooks (no pid)");
-
-/* ---- 补充网络结构体 ---- */
-#define AF_INET  2
-#define ntohs(x) __builtin_bswap16(x)
-
-struct in_addr {
-    __u32 s_addr;
-};
-
-struct sockaddr_in {
-    unsigned short sin_family;
-    unsigned short sin_port;
-    struct in_addr sin_addr;
-    unsigned char sin_zero[8];
-};
-
-struct iovec {
-    void __user *iov_base;
-    size_t iov_len;
-};
-
-struct msghdr {
-    void *msg_name;
-    int msg_namelen;
-    struct iovec *msg_iov;
-    size_t msg_iovlen;
-    void *msg_control;
-    size_t msg_controllen;
-    unsigned msg_flags;
-};
-
-static void ip_to_str(__u32 addr, char *out) {
-    unsigned char *p = (unsigned char *)&addr;
-    int pos = 0;
-    for (int i = 0; i < 4; i++) {
-        if (i > 0) out[pos++] = '.';
-        unsigned char byte = p[i];
-        if (byte >= 100) { out[pos++] = '0' + byte/100; byte %= 100; }
-        if (byte >= 10 || p[i] >= 100) { out[pos++] = '0' + byte/10; byte %= 10; }
-        out[pos++] = '0' + byte;
-    }
-    out[pos] = '\0';
-}
+KPM_DESCRIPTION("Minimal syscall trace for network");
 
 static int monitor_running = 0;
 
-/* ---- Hook: connect ---- */
 static void before_connect(hook_fargs3_t *fargs, void *udata) {
     if (!monitor_running) return;
-    int fd = (int)syscall_argn(fargs, 0);
-    struct sockaddr_in __user *usa = (struct sockaddr_in __user *)syscall_argn(fargs, 1);
-    if (!usa) return;
-
-    struct sockaddr_in sin;
-    if (compat_strncpy_from_user((char *)&sin, (const char __user *)usa, sizeof(sin)) != sizeof(sin))
-        return;
-    if (sin.sin_family != AF_INET) return;
-
-    char ip[16];
-    ip_to_str(sin.sin_addr.s_addr, ip);
-    printk(KERN_INFO "KMS_NET| CONNECT | fd=%d -> %s:%d\n",
-           fd, ip, ntohs(sin.sin_port));
+    printk(KERN_INFO "KMS_NET| CONNECT called\n");
 }
 
-/* ---- Hook: sendto ---- */
 static void before_sendto(hook_fargs6_t *fargs, void *udata) {
     if (!monitor_running) return;
-    int fd = (int)syscall_argn(fargs, 0);
-    size_t len = (size_t)syscall_argn(fargs, 2);
-    struct sockaddr_in __user *usa = (struct sockaddr_in __user *)syscall_argn(fargs, 4);
-    if (!usa) return;
-
-    struct sockaddr_in sin;
-    if (compat_strncpy_from_user((char *)&sin, (const char __user *)usa, sizeof(sin)) != sizeof(sin))
-        return;
-    if (sin.sin_family != AF_INET) return;
-
-    char ip[16];
-    ip_to_str(sin.sin_addr.s_addr, ip);
-    printk(KERN_INFO "KMS_NET| SENDTO | fd=%d -> %s:%d size=%zu\n",
-           fd, ip, ntohs(sin.sin_port), len);
+    printk(KERN_INFO "KMS_NET| SENDTO called\n");
 }
 
-/* ---- Hook: sendmsg ---- */
 static void before_sendmsg(hook_fargs3_t *fargs, void *udata) {
     if (!monitor_running) return;
-    int fd = (int)syscall_argn(fargs, 0);
-    struct msghdr __user *umsg = (struct msghdr __user *)syscall_argn(fargs, 1);
-    if (!umsg) return;
-
-    struct msghdr msg;
-    if (compat_strncpy_from_user((char *)&msg, (const char __user *)umsg, sizeof(msg)) != sizeof(msg))
-        return;
-    if (!msg.msg_name) return;
-
-    struct sockaddr_in sin;
-    if (compat_strncpy_from_user((char *)&sin, (const char __user *)msg.msg_name, sizeof(sin)) != sizeof(sin))
-        return;
-    if (sin.sin_family != AF_INET) return;
-
-    char ip[16];
-    ip_to_str(sin.sin_addr.s_addr, ip);
-    printk(KERN_INFO "KMS_NET| SENDMSG | fd=%d -> %s:%d size=%zu\n",
-           fd, ip, ntohs(sin.sin_port), msg.msg_iovlen);
+    printk(KERN_INFO "KMS_NET| SENDMSG called\n");
 }
 
-/* ---- CTL0 控制 ---- */
 static long netmon_control0(const char *args, char *__user out_msg, int outlen) {
     if (!args) { if (out_msg) strncpy(out_msg, "no cmd", outlen); return 0; }
     if (strcmp(args, "run") == 0) { monitor_running=1; printk(KERN_INFO "KMS_NET: running\n"); if (out_msg) strncpy(out_msg, "running", outlen); }

@@ -5,30 +5,17 @@
 #include <syscall.h>
 
 KPM_NAME("KMS_NetMonitor");
-KPM_VERSION("1.0.7");
+KPM_VERSION("1.0.8");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Network syscall hooks with debug");
+KPM_DESCRIPTION("Test with openat hook");
 
 static int monitor_running = 0;
 
-static void before_connect(hook_fargs3_t *fargs, void *udata) {
-    // 先无条件打印，确认回调被触发
-    printk(KERN_INFO "KMS_NET| CONNECT triggered\n");
+// 用 openat 验证框架
+static void before_openat(hook_fargs4_t *fargs, void *udata) {
     if (!monitor_running) return;
-    printk(KERN_INFO "KMS_NET| CONNECT running\n");
-}
-
-static void before_sendto(hook_fargs6_t *fargs, void *udata) {
-    printk(KERN_INFO "KMS_NET| SENDTO triggered\n");
-    if (!monitor_running) return;
-    printk(KERN_INFO "KMS_NET| SENDTO running\n");
-}
-
-static void before_sendmsg(hook_fargs3_t *fargs, void *udata) {
-    printk(KERN_INFO "KMS_NET| SENDMSG triggered\n");
-    if (!monitor_running) return;
-    printk(KERN_INFO "KMS_NET| SENDMSG running\n");
+    printk(KERN_INFO "KMS_NET| OPENAT called\n");
 }
 
 static long control0(const char *args, char *__user out_msg, int outlen) {
@@ -40,21 +27,19 @@ static long control0(const char *args, char *__user out_msg, int outlen) {
 }
 
 static long init(const char *args, const char *event, void *__user reserved) {
+    printk(KERN_INFO "KMS_NET: init start\n");
     hook_err_t err;
-    err = fp_hook_syscalln(__NR_connect, 3, before_connect, 0, 0);
-    printk(KERN_INFO "KMS_NET: connect hook err=%d\n", err);
-    err = fp_hook_syscalln(__NR_sendto, 6, before_sendto, 0, 0);
-    printk(KERN_INFO "KMS_NET: sendto hook err=%d\n", err);
-    err = fp_hook_syscalln(__NR_sendmsg, 3, before_sendmsg, 0, 0);
-    printk(KERN_INFO "KMS_NET: sendmsg hook err=%d\n", err);
-    printk(KERN_INFO "KMS_NET: hooks installed (errors above may be non-fatal)\n");
-    return 0;  // 即使 hook 失败也返回成功，确保模块加载
+    err = fp_hook_syscalln(__NR_openat, 4, before_openat, 0, 0);
+    printk(KERN_INFO "KMS_NET: openat hook err=%d\n", err);
+    if (err) {
+        printk(KERN_ERR "KMS_NET: openat hook fail, but module still loads\n");
+    }
+    printk(KERN_INFO "KMS_NET: init done\n");
+    return 0;
 }
 
 static long netmon_exit(void *__user reserved) {
-    fp_unhook_syscalln(__NR_connect, before_connect, 0);
-    fp_unhook_syscalln(__NR_sendto, before_sendto, 0);
-    fp_unhook_syscalln(__NR_sendmsg, before_sendmsg, 0);
+    fp_unhook_syscalln(__NR_openat, before_openat, 0);
     printk(KERN_INFO "KMS_NET: unloaded\n");
     return 0;
 }

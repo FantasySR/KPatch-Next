@@ -5,31 +5,17 @@
 #include <syscall.h>
 
 KPM_NAME("KMS_NetMonitor");
-KPM_VERSION("2.0.0");
+KPM_VERSION("2.0.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Network monitor with hardcoded syscall numbers");
+KPM_DESCRIPTION("Network monitor skeleton with openat");
 
 static int monitor_running = 0;
 
-// ARM64 syscall numbers: connect=203, sendto=206, sendmsg=211
-#define SYS_connect 203
-#define SYS_sendto  206
-#define SYS_sendmsg 211
-
-static void before_connect(hook_fargs3_t *fargs, void *udata) {
+// 用已验证成功的 openat 作为骨架
+static void before_openat(hook_fargs4_t *fargs, void *udata) {
     if (!monitor_running) return;
-    printk(KERN_INFO "KMS_NET| CONNECT called\n");
-}
-
-static void before_sendto(hook_fargs6_t *fargs, void *udata) {
-    if (!monitor_running) return;
-    printk(KERN_INFO "KMS_NET| SENDTO called\n");
-}
-
-static void before_sendmsg(hook_fargs3_t *fargs, void *udata) {
-    if (!monitor_running) return;
-    printk(KERN_INFO "KMS_NET| SENDMSG called\n");
+    printk(KERN_INFO "KMS_NET| OPENAT called\n");
 }
 
 static long control0(const char *args, char *__user out_msg, int outlen) {
@@ -42,21 +28,14 @@ static long control0(const char *args, char *__user out_msg, int outlen) {
 
 static long init(const char *args, const char *event, void *__user reserved) {
     printk(KERN_INFO "KMS_NET: init start\n");
-    hook_err_t err;
-    err = fp_hook_syscalln(SYS_connect, 3, before_connect, 0, 0);
-    printk(KERN_INFO "KMS_NET: connect hook err=%d\n", err);
-    err = fp_hook_syscalln(SYS_sendto, 6, before_sendto, 0, 0);
-    printk(KERN_INFO "KMS_NET: sendto hook err=%d\n", err);
-    err = fp_hook_syscalln(SYS_sendmsg, 3, before_sendmsg, 0, 0);
-    printk(KERN_INFO "KMS_NET: sendmsg hook err=%d\n", err);
+    hook_err_t err = fp_hook_syscalln(__NR_openat, 4, before_openat, 0, 0);
+    printk(KERN_INFO "KMS_NET: openat hook err=%d\n", err);
     printk(KERN_INFO "KMS_NET: init done\n");
     return 0;
 }
 
 static long netmon_exit(void *__user reserved) {
-    fp_unhook_syscalln(SYS_connect, before_connect, 0);
-    fp_unhook_syscalln(SYS_sendto, before_sendto, 0);
-    fp_unhook_syscalln(SYS_sendmsg, before_sendmsg, 0);
+    fp_unhook_syscalln(__NR_openat, before_openat, 0);
     printk(KERN_INFO "KMS_NET: unloaded\n");
     return 0;
 }

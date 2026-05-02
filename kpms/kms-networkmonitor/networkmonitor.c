@@ -6,10 +6,10 @@
 #include <syscall.h>
 
 KPM_NAME("KMS_NetMonitor");
-KPM_VERSION("2.2.0");
+KPM_VERSION("2.2.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Http URL catcher - raw dump");
+KPM_DESCRIPTION("Raw HTTP dumper - guaranteed load");
 
 static int monitor_running = 0;
 
@@ -20,19 +20,19 @@ static void before_sendto(hook_fargs6_t *fargs, void *udata) {
     size_t len = (size_t)syscall_argn(fargs, 2);
     if (!user_buf || len == 0) return;
 
-    // 拷贝最多 512 字节到内核缓冲区，避免数据过大
+    // 安全拷贝到内核缓冲区
     char tmp[512];
-    int copy_len = len < sizeof(tmp) ? len : sizeof(tmp);
+    int copy_len = len < sizeof(tmp)-1 ? len : sizeof(tmp)-1;
     copy_len = compat_strncpy_from_user(tmp, user_buf, copy_len);
     if (copy_len <= 0) return;
 
-    // 只关注 HTTP 请求（以 GET / POST 开头）
+    // 最简单的过滤：只关注 GET/POST（避免本地通信刷屏）
     if (copy_len < 4) return;
     if (!(tmp[0] == 'G' && tmp[1] == 'E' && tmp[2] == 'T' && tmp[3] == ' ') &&
         !(tmp[0] == 'P' && tmp[1] == 'O' && tmp[2] == 'S' && tmp[3] == 'T'))
         return;
 
-    // 打印整个请求头，你就能看到 URL 和 Host
+    // 直接打印，不调用任何字符串函数
     printk(KERN_INFO "KMS_NET| HTTP: %.*s\n", copy_len, tmp);
 }
 

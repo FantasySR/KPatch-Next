@@ -7,41 +7,26 @@
 #include <syscall.h>
 
 KPM_NAME("KMS_NetMonitor");
-KPM_VERSION("2.0.5");
+KPM_VERSION("2.0.6");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("FantasySR");
-KPM_DESCRIPTION("Sendto monitor - IP only");
-
-#define AF_INET 2
-#define ntohs(x) __builtin_bswap16(x)
-
-struct in_addr { __u32 s_addr; };
-
-struct sockaddr_in {
-    unsigned short sin_family;
-    unsigned short sin_port;
-    struct in_addr sin_addr;
-    unsigned char sin_zero[8];
-};
+KPM_DESCRIPTION("Debug sendto parameters");
 
 static int monitor_running = 0;
 
 static void before_sendto(hook_fargs6_t *fargs, void *udata) {
     if (!monitor_running) return;
 
-    struct sockaddr_in __user *usa = (struct sockaddr_in __user *)syscall_argn(fargs, 4);
-    if (!usa) return;
+    // 打印 sendto 的六个参数（全部作为 unsigned long）
+    unsigned long arg0 = syscall_argn(fargs, 0);
+    unsigned long arg1 = syscall_argn(fargs, 1);
+    unsigned long arg2 = syscall_argn(fargs, 2);
+    unsigned long arg3 = syscall_argn(fargs, 3);
+    unsigned long arg4 = syscall_argn(fargs, 4);
+    unsigned long arg5 = syscall_argn(fargs, 5);
 
-    struct sockaddr_in sin;
-    if (compat_strncpy_from_user((char *)&sin, (const char __user *)usa, sizeof(sin)) != sizeof(sin))
-        return;
-
-    // 过滤：只保留 IPv4 网络通信，忽略本地通信
-    if (sin.sin_family != AF_INET) return;
-
-    unsigned char *ip = (unsigned char *)&sin.sin_addr.s_addr;
-    printk(KERN_INFO "KMS_NET| %d.%d.%d.%d:%d\n",
-           ip[0], ip[1], ip[2], ip[3], ntohs(sin.sin_port));
+    printk(KERN_INFO "KMS_NET| sendto args: %lx %lx %lx %lx %lx %lx\n",
+           arg0, arg1, arg2, arg3, arg4, arg5);
 }
 
 static long control0(const char *args, char *__user out_msg, int outlen) {
